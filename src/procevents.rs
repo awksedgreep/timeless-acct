@@ -11,7 +11,6 @@
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -20,6 +19,7 @@ use crate::collect::process::Units;
 use crate::netlink::{message, messages, Netlink, Received, NLMSG_DONE};
 use crate::procfs::process::parse_pid_stat;
 use crate::procfs::{Described, ProcRoot};
+use crate::queue::{queue, Receiver};
 use crate::taskstats::epoch_now;
 
 const NETLINK_CONNECTOR: libc::c_int = 11;
@@ -43,8 +43,9 @@ const PROC_EVENT_NONE: u32 = 0;
 const PROC_EVENT_EXEC: u32 = 2;
 
 const POLL: Duration = Duration::from_millis(250);
-/// Descriptions waiting for the collector; allocated up front.
-const QUEUE: usize = 16_384;
+/// Descriptions waiting for the collector, at the most. One is larger
+/// than an exit record, by a command line.
+const QUEUE: usize = 131_072;
 
 /// What the connector said, as far as this listener cares.
 #[derive(Debug, PartialEq, Eq)]
@@ -182,7 +183,7 @@ impl ExecListener {
         acknowledged(&netlink)?;
         netlink.set_timeout(POLL)?;
 
-        let (sender, receiver) = mpsc::sync_channel(QUEUE);
+        let (sender, receiver) = queue(QUEUE);
         let counters = Arc::new(Counters::default());
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -214,7 +215,7 @@ impl ExecListener {
                                             counters.missed.fetch_add(1, Ordering::Relaxed);
                                         }
                                         Some(exec) => {
-                                            if sender.try_send(exec).is_err() {
+                                            if !sender.offer(exec) {
                                                 counters.lost.fetch_add(1, Ordering::Relaxed);
                                             }
                                         }
@@ -246,7 +247,7 @@ impl ExecListener {
 
     /// Everything described since the last call.
     pub fn drain(&self) -> Vec<Exec> {
-        self.receiver.try_iter().collect()
+        self.receiver.drain()
     }
 
     /// Execs the kernel reported.

@@ -220,6 +220,33 @@ Threads that ended before the collector started are in the process's own
 `/proc` figures and not in any record the collector received. Where a
 process was also sampled, the record takes whichever of the two saw more.
 
+### What is heard waits in a queue that is empty
+
+A listener reads records as the kernel sends them, and the collector
+takes them at a sweep. Between the two is a queue, which has to hold a
+fork storm and is otherwise empty.
+
+It was first a channel of 262,144 places, which Rust allocates when it is
+made: 115 MB for a collector on a quiet host. Then one of 16,384, which
+was 5 MB, and lost 7,850 records in the two busiest minutes of a browser
+being compiled, 28,000 processes ending in each.
+
+Both were the same mistake, of paying for the bound. The queue is now one
+that grows, with a count of what is in it, and refuses at 262,144. It
+costs what is waiting.
+
+The two were run side by side through 120,000 processes started and
+ended in six seconds. The queue of 16,384 lost 103,794 exit records and
+92,693 execs. The one that grows lost none.
+
+Keeping them has a price, which is paid once they are taken. A tick's
+records are made into log entries and spans together and written
+together, at about 9 KB each while that is done: the collector was at
+1.35 GB for one tick, and at 300 MB a minute later. Writing a tick in
+parts would bound that. It is not done: a host that ends 19,000
+processes a second is not the host this is for, and what it is for is
+that the records are there afterwards.
+
 ### When the kernel says no
 
 Without `CAP_NET_ADMIN` the collector runs anyway. A process that was there

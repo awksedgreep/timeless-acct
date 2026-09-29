@@ -363,7 +363,10 @@ of their own, by command name (`comm`) and by user (`user`).
 `acct_execs_lost`.
 
 A rising `acct_exits_lost` means processes are ending faster than their
-records can be read. `acct_execs_missed` counts processes that were gone
+records can be read. Up to 262,144 wait between two sweeps, which at the
+default interval is 26,000 tasks ending a second; a browser being compiled
+on 22 CPUs ended 470 processes a second at its busiest.
+`acct_execs_missed` counts processes that were gone
 before they could be described: their records have a name and no
 arguments.
 

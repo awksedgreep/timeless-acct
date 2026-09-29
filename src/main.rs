@@ -18,6 +18,7 @@ mod procevents;
 mod procfs;
 #[cfg(feature = "embedded")]
 mod query;
+mod queue;
 mod sink;
 mod taskstats;
 #[cfg(test)]

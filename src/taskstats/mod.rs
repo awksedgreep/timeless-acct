@@ -15,24 +15,26 @@ pub mod record;
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::netlink::Received;
+use crate::queue::{queue, Receiver};
 use netlink::{exit_records, Socket};
 use record::{TaskExit, AFORK};
 
 /// How long a read waits before the thread checks whether to stop.
 const POLL: Duration = Duration::from_millis(250);
-/// Exit records waiting for the collector. A full queue drops records and
-/// counts them, rather than growing without bound during a fork storm.
+/// Exit records waiting for the collector, at the most. What arrives at
+/// a full queue is dropped and counted, rather than the queue growing
+/// without bound during a fork storm.
 ///
-/// The queue's memory is allocated up front, at about 300 bytes a record,
-/// so this is also what exit accounting costs a host that is quiet: 5 MiB.
-/// At the default sweep of ten seconds it absorbs 1,600 exits a second.
-const QUEUE: usize = 16_384;
+/// A record is about 300 bytes, so a full queue is 80 MiB, and an empty
+/// one is nothing. At the default sweep of ten seconds it absorbs 26,000
+/// tasks ending a second. A queue of 16,384 lost 7,850 records in two
+/// minutes of a browser being compiled on 22 CPUs.
+const QUEUE: usize = 262_144;
 
 pub fn epoch_now() -> f64 {
     SystemTime::now()
@@ -61,7 +63,7 @@ impl Listener {
     /// (no `CAP_NET_ADMIN`) is an error the caller can act on.
     pub fn start(cpus: &str) -> io::Result<Self> {
         let socket = Socket::listen(cpus, POLL)?;
-        let (sender, receiver) = mpsc::sync_channel(QUEUE);
+        let (sender, receiver) = queue(QUEUE);
         let lost = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -80,7 +82,7 @@ impl Listener {
                                     let Some(exit) = record::parse(bytes) else {
                                         continue;
                                     };
-                                    if sender.try_send(Received1 { at, exit }).is_err() {
+                                    if !sender.offer(Received1 { at, exit }) {
                                         lost.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
@@ -109,7 +111,7 @@ impl Listener {
 
     /// Everything received since the last call.
     pub fn drain(&self) -> Vec<Received1> {
-        self.receiver.try_iter().collect()
+        self.receiver.drain()
     }
 
     /// Times records were lost: a full kernel buffer or a full queue. Each
