@@ -257,7 +257,7 @@ impl Sink for EmbeddedSink {
                         span.span_id.as_slice(),
                         span.parent_span_id.as_ref().map(|id| id.as_slice()),
                         span.name,
-                        span.service,
+                        span.service(host),
                         span.status(),
                         span.start_ns,
                         span.duration_ns,
@@ -340,7 +340,7 @@ mod tests {
             span_id: [id; 8],
             parent_span_id: parent.map(|id| [id; 8]),
             name: name.into(),
-            service: "build.service".into(),
+            unit: "build.service".into(),
             ok: Some(ok),
             ending: if ok { String::new() } else { "exited 1".into() },
             start_ns: 1_753_000_000_000_000_000 + i64::from(id),
@@ -391,7 +391,7 @@ mod tests {
         {
             let mut sink = EmbeddedSink::open(&options).unwrap();
             sink.write(
-                "ohm",
+                "host-a",
                 &Tick {
                     metrics: &batch(1_753_000_000, 12.5),
                     events: &[],
@@ -400,7 +400,7 @@ mod tests {
             )
             .unwrap();
             sink.write(
-                "ohm",
+                "host-a",
                 &Tick {
                     metrics: &batch(1_753_000_010, 50.0),
                     events: &[
@@ -448,7 +448,7 @@ mod tests {
             )
             .unwrap();
         let stored: Value = serde_json::from_str(&stored).unwrap();
-        assert_eq!(stored["host"], "ohm");
+        assert_eq!(stored["host"], "host-a");
         assert_eq!(stored["proc"], "postgres[42]");
 
         // The indexed keys select without a scan of the metadata.
@@ -456,7 +456,7 @@ mod tests {
             .logs
             .query_row(
                 "SELECT level, message, metadata FROM logs
-                  WHERE service = 'postgres' AND status = 'SIGSEGV' AND host = 'ohm'",
+                  WHERE service = 'postgres' AND status = 'SIGSEGV' AND host = 'host-a'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!((cargo.0.as_str(), cargo.3.as_str()), ("cargo", "ok"));
         assert_eq!((rustc.0.as_str(), rustc.3.as_str()), ("rustc", "error"));
         assert_eq!(rustc.4, "exited 1");
-        assert_eq!(rustc.5, "build.service");
+        assert_eq!(rustc.5, "host-a/build.service");
         assert_eq!(rustc.2.as_deref(), Some(cargo.1.as_slice()));
         // A root has no parent, however the store writes that.
         assert!(cargo.2.as_ref().is_none_or(|id| id.iter().all(|b| *b == 0)));
@@ -521,7 +521,7 @@ mod tests {
             .traces
             .query_row(
                 "SELECT count(*) FROM traces
-                  WHERE service = 'build.service' AND name = 'rustc' AND status = 'error'",
+                  WHERE service = 'host-a/build.service' AND name = 'rustc' AND status = 'error'",
                 [],
                 |row| row.get(0),
             )
@@ -544,7 +544,7 @@ mod tests {
                 );
             }
             sink.write(
-                "ohm",
+                "host-a",
                 &Tick {
                     metrics: &metrics,
                     events: &[],

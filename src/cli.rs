@@ -420,6 +420,10 @@ pub struct TreesArgs {
     #[arg(long)]
     pub unit: Option<String>,
 
+    /// The host the unit is on [default: this one]
+    #[arg(long, requires = "unit")]
+    pub host: Option<String>,
+
     /// Only jobs in which something failed
     #[arg(long)]
     pub failed: bool,

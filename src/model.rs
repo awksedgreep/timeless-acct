@@ -109,9 +109,8 @@ pub struct Span {
     pub parent_span_id: Option<[u8; 8]>,
     /// The command's name.
     pub name: String,
-    /// The unit it ran in, which is what runs on a host as a service does
-    /// in a system.
-    pub service: String,
+    /// The unit it ran in; `-` if it ran in none.
+    pub unit: String,
     /// `None` if how it ended is not known.
     pub ok: Option<bool>,
     /// How it ended, in words.
@@ -123,6 +122,17 @@ pub struct Span {
 }
 
 impl Span {
+    /// What a span's service is: the unit, on the host.
+    ///
+    /// A unit is what runs on a host as a service does in a system. The
+    /// host is part of the name because the planes hold many hosts' spans
+    /// together, and can tell spans apart by their service and their name
+    /// and by nothing else: `timescaledb.service` on two hosts would be
+    /// one service, with no way to ask for either's.
+    pub fn service(&self, host: &str) -> String {
+        format!("{host}/{}", self.unit)
+    }
+
     /// As the store spells it.
     #[cfg(any(feature = "embedded", test))]
     pub fn status(&self) -> &'static str {

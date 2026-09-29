@@ -129,7 +129,7 @@ application is:
 
 | field | value |
 |---|---|
-| host | `ohm` |
+| host | `web-1` |
 | metric | `unit_cpu_pct` |
 | series label | `unit` = `postgresql.service` |
 
@@ -137,7 +137,7 @@ and for one process:
 
 | field | value |
 |---|---|
-| host | `ohm` |
+| host | `web-1` |
 | metric | `proc_cpu_pct` |
 | series label | `proc` = `postgres[1234]` |
 
@@ -395,13 +395,19 @@ everything this build ran, and in what order.
 | of a span | is |
 |---|---|
 | name | the command's name: `rustc` |
-| service | the unit it ran in: `mark/timeless-stack.service` |
+| service | the unit it ran in, on its host: `web-1/timeless-stack.service`; `web-1/-` if it ran in none |
 | parent | the process that started it, if that is part of the same trace |
 | status | `ok`, or `error` with `exited 2` or `killed by SIGSEGV` |
 | attributes | `process.pid`, `process.parent_pid`, `process.owner`, `process.command_line`, `process.started_as`, `process.executable.path`, `process.exit.code`, `process.signal`, `process.unit`, `process.forked`, `process.threads`, `process.cpu_seconds`, `process.cpu_pct`, `process.peak_rss_bytes`, `process.io_read_bytes`, `process.io_write_bytes` |
 
-So in anything that reads traces, the services are the units of the host,
-and the operations of a service are the commands that ran in it.
+So in anything that reads traces, the services are the units of each
+host, and the operations of a service are the commands that ran in it.
+
+The host is part of the service's name, and not only beside it, because
+the traces plane tells spans apart by their service and their name and by
+nothing else. The same unit on two hosts would be one service, with no way
+to ask for either's. The unit by itself is `process.unit`, and the host
+`host.name` on the span's resource.
 
 **A trace is a job**: a process group. A shell makes one for each command
 it is given, a pipeline is one, and systemd makes one for each run of a
@@ -497,6 +503,7 @@ timeless-acct exits --since -1h --summary --by unit
 timeless-acct trees --since -1h                 # jobs, as trees
 timeless-acct trees --comm rustc --failed       # builds in which something failed
 timeless-acct trees --unit mark/timeless-stack.service --width 0
+timeless-acct trees --unit caddy.service --host web-2   # of a store that holds another host's
 ```
 
 ```text

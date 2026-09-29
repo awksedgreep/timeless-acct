@@ -391,11 +391,12 @@ fn shorten(text: &str, width: usize) -> String {
 
 pub(crate) fn nodes(connection: &Connection, trace: &[u8]) -> Result<Vec<Node>> {
     let mut statement = connection.prepare_cached(&format!(
-        "SELECT span_id, parent_span_id, name, service, status, status_description,
+        "SELECT span_id, parent_span_id, name, status, status_description,
                 start_ts, duration_ns, attributes
            FROM {TRACES_TABLE} WHERE trace_id = ?1 ORDER BY start_ts, span_id"
     ))?;
     let rows = statement.query_map([trace], |row| {
+        let attributes: Value = serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default();
         Ok(Node {
             id: row.get(0)?,
             // The store writes "no parent" as all zeroes.
@@ -403,12 +404,17 @@ pub(crate) fn nodes(connection: &Connection, trace: &[u8]) -> Result<Vec<Node>> 
                 .get::<_, Option<Vec<u8>>>(1)?
                 .filter(|id| id.iter().any(|byte| *byte != 0)),
             name: row.get(2)?,
-            unit: row.get(3)?,
-            failed: row.get::<_, String>(4)? == "error",
-            ending: row.get(5)?,
-            start_ns: row.get(6)?,
-            duration_ns: row.get(7)?,
-            attributes: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+            // As the span says of itself, and not taken out of its
+            // service's name, which has the host in it.
+            unit: attributes["process.unit"]
+                .as_str()
+                .unwrap_or("-")
+                .to_string(),
+            failed: row.get::<_, String>(3)? == "error",
+            ending: row.get(4)?,
+            start_ns: row.get(5)?,
+            duration_ns: row.get(6)?,
+            attributes,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -504,7 +510,13 @@ pub fn trees(args: &TreesArgs) -> Result<()> {
         Sql::Integer((since * 1e9) as i64),
         Sql::Integer((until * 1e9) as i64),
     ];
-    for (column, wanted) in [("name", &args.comm), ("service", &args.unit)] {
+    // A unit is asked for as the store names it: on its host.
+    let host = match &args.host {
+        Some(host) => host.clone(),
+        None => crate::check::hostname(&crate::procfs::ProcRoot::default()),
+    };
+    let service = args.unit.as_ref().map(|unit| format!("{host}/{unit}"));
+    for (column, wanted) in [("name", &args.comm), ("service", &service)] {
         if let Some(wanted) = wanted {
             values.push(Sql::Text(wanted.clone()));
             sql.push_str(&format!(" AND {column} = ?{}", values.len()));

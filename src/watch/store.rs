@@ -482,12 +482,13 @@ mod tests {
         let mut attributes = Map::new();
         attributes.insert("process.command_line".into(), format!("{name} -x").into());
         attributes.insert("process.cpu_seconds".into(), 0.5.into());
+        attributes.insert("process.unit".into(), "build.service".into());
         Span {
             trace_id: [trace; 16],
             span_id: [id; 8],
             parent_span_id: parent.map(|id| [id; 8]),
             name: name.into(),
-            service: "build.service".into(),
+            unit: "build.service".into(),
             ok: Some(ok),
             ending: if ok { String::new() } else { "exited 1".into() },
             start_ns: (start * 1e9) as i64,
@@ -522,7 +523,7 @@ mod tests {
                 }
             }
             sink.write(
-                "ohm",
+                "host-a",
                 &Tick {
                     metrics: &metrics,
                     events: &[],
@@ -532,7 +533,7 @@ mod tests {
             .unwrap();
         }
         sink.write(
-            "ohm",
+            "host-a",
             &Tick {
                 metrics: &MetricBatch::new(0),
                 events: &[
@@ -757,7 +758,7 @@ mod tests {
                 busy,
             );
             sink.write(
-                "ohm",
+                "host-a",
                 &Tick {
                     metrics: &metrics,
                     events: &[],

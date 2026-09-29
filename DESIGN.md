@@ -349,6 +349,27 @@ what is ending in this same tick, and last in `/proc` itself: a subshell
 that is still running has not called exec, has not ended, and has not
 lived to a sweep, and is there.
 
+### A service is a unit on a host
+
+Metrics have a label for the host, and accounting records a field that
+the logs plane keeps an index of. Spans had the host on their resource,
+as OpenTelemetry has it, and it was no use there: pushed from two hosts,
+the same unit was one service in the traces plane, which finds spans by
+their service and their name and has nothing to ask a resource with.
+
+So the host is in the service's name: `web-1/caddy.service`. It is there
+in a local store as well, which holds one host and has no need of it,
+because a store is laid out to be handed to the planes as it stands, and
+a span that is one thing pushed and another handed over is two things.
+
+The other way was an index on `host.name` in the plane's own table. It
+keeps the names clean, and it is a change to every stack that is to
+receive spans, made before the first span arrives: the indexes of a
+traces table are chosen when it is created.
+
+What reads a span for its unit reads `process.unit`, and does not take
+the name apart.
+
 ### The same figures, to two readers
 
 A span is made from the accounting record of the same process, not beside

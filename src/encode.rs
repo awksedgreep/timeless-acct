@@ -80,7 +80,7 @@ pub fn scope() -> Value {
 /// What a span's resource is: the unit, on the host.
 pub fn resource(host: &str, span: &Span) -> Map<String, Value> {
     let mut resource = Map::new();
-    resource.insert("service.name".into(), span.service.clone().into());
+    resource.insert("service.name".into(), span.service(host).into());
     resource.insert("host.name".into(), host.into());
     resource
 }
@@ -115,18 +115,15 @@ fn key_values(object: &Map<String, Value>) -> Value {
 /// An OTLP export request, as JSON: the spans, under the resource each
 /// belongs to.
 pub fn otlp_json(host: &str, spans: &[Span]) -> String {
-    let mut services: Vec<&str> = spans.iter().map(|span| span.service.as_str()).collect();
-    services.sort_unstable();
-    services.dedup();
+    let mut units: Vec<&str> = spans.iter().map(|span| span.unit.as_str()).collect();
+    units.sort_unstable();
+    units.dedup();
 
-    let resource_spans: Vec<Value> = services
+    let resource_spans: Vec<Value> = units
         .into_iter()
-        .map(|service| {
-            let of_service: Vec<&Span> = spans
-                .iter()
-                .filter(|span| span.service == service)
-                .collect();
-            let encoded: Vec<Value> = of_service
+        .map(|unit| {
+            let of_unit: Vec<&Span> = spans.iter().filter(|span| span.unit == unit).collect();
+            let encoded: Vec<Value> = of_unit
                 .iter()
                 .map(|span| {
                     let mut out = serde_json::json!({
@@ -153,7 +150,7 @@ pub fn otlp_json(host: &str, spans: &[Span]) -> String {
                 })
                 .collect();
             serde_json::json!({
-                "resource": {"attributes": key_values(&resource(host, of_service[0]))},
+                "resource": {"attributes": key_values(&resource(host, of_unit[0]))},
                 "scopeSpans": [{"scope": scope(), "spans": encoded}],
             })
         })
@@ -175,11 +172,11 @@ mod tests {
             &labels(vec![("pid", "42".into()), ("comm", "a\"b\\c".into())]),
             12.0,
         );
-        let text = prometheus_text("ohm", &batch);
+        let text = prometheus_text("host-a", &batch);
         assert_eq!(
             text,
-            "sys_load1{host=\"ohm\"} 0.5 1753000000000\n\
-             proc_cpu_pct{host=\"ohm\",pid=\"42\",comm=\"a\\\"b\\\\c\"} 12 1753000000000\n"
+            "sys_load1{host=\"host-a\"} 0.5 1753000000000\n\
+             proc_cpu_pct{host=\"host-a\",pid=\"42\",comm=\"a\\\"b\\\\c\"} 12 1753000000000\n"
         );
     }
 
@@ -206,7 +203,7 @@ mod tests {
         assert!(batch.samples.is_empty());
     }
 
-    fn span(service: &str, parent: Option<[u8; 8]>, ok: Option<bool>) -> Span {
+    fn span(unit: &str, parent: Option<[u8; 8]>, ok: Option<bool>) -> Span {
         let mut attributes = Map::new();
         attributes.insert("process.pid".into(), Value::from(4242));
         attributes.insert("process.cpu_seconds".into(), Value::from(2.5));
@@ -217,7 +214,7 @@ mod tests {
             span_id: [0x01; 8],
             parent_span_id: parent,
             name: "rustc".into(),
-            service: service.into(),
+            unit: unit.into(),
             ok,
             ending: "exited 1".into(),
             start_ns: 1_753_000_000_000_000_000,
@@ -233,18 +230,18 @@ mod tests {
             span("mark/app-term.scope", Some([0x02; 8]), Some(false)),
             span("build.service", None, None),
         ];
-        let body: Value = serde_json::from_str(&otlp_json("ohm", &spans)).unwrap();
+        let body: Value = serde_json::from_str(&otlp_json("host-a", &spans)).unwrap();
         let resources = body["resourceSpans"].as_array().unwrap();
         assert_eq!(resources.len(), 2);
 
         let build = &resources[0];
         assert_eq!(
             build["resource"]["attributes"][0],
-            serde_json::json!({"key": "host.name", "value": {"stringValue": "ohm"}})
+            serde_json::json!({"key": "host.name", "value": {"stringValue": "host-a"}})
         );
         assert_eq!(
             build["resource"]["attributes"][1]["value"]["stringValue"],
-            "build.service"
+            "host-a/build.service"
         );
         let of_build = build["scopeSpans"][0]["spans"].as_array().unwrap();
         assert_eq!(of_build.len(), 2);
@@ -301,12 +298,12 @@ mod tests {
             message: "bash[7] killed".into(),
             fields,
         };
-        let text = ndjson("ohm", &[event]);
+        let text = ndjson("host-a", &[event]);
         let line: Value = serde_json::from_str(text.trim_end()).unwrap();
         assert_eq!(line["_msg"], "bash[7] killed");
         assert_eq!(line["_time"], 1_753_000_000_000_001_i64);
         assert_eq!(line["level"], "warning");
-        assert_eq!(line["host"], "ohm");
+        assert_eq!(line["host"], "host-a");
         assert_eq!(line["service"], "bash");
         assert_eq!(line["pid"], 7);
     }

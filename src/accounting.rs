@@ -452,7 +452,7 @@ pub fn span_of(record: &Event, identity: &Identity) -> Span {
         span_id: identity.span_id,
         parent_span_id: identity.parent_span_id,
         name: text("service").to_string(),
-        service: match text("unit") {
+        unit: match text("unit") {
             "" => "-".to_string(),
             unit => unit.to_string(),
         },
@@ -510,7 +510,8 @@ mod tests {
         assert_eq!(span.span_id, identity.span_id);
         assert!(span.parent_span_id.is_some());
         assert_eq!(span.name, "cc1plus");
-        assert_eq!(span.service, "mark/app-term.scope");
+        assert_eq!(span.unit, "mark/app-term.scope");
+        assert_eq!(span.service("host-a"), "host-a/mark/app-term.scope");
         assert_eq!(span.status(), "error");
         assert_eq!(span.ending, "exited 1");
         assert_eq!(span.start_ns, 997_500_000_000);
@@ -531,12 +532,17 @@ mod tests {
         let of = |status, flag| {
             let record = exit_event(&exit(status, flag), None, Known::default(), "mark");
             let span = span_of(&record, &identity());
-            (span.status(), span.ending, span.service)
+            (span.status(), span.service("host-a"), span.ending)
         };
-        assert_eq!(of(0, 0), ("ok", String::new(), "-".to_string()));
+        // In no unit, it is the host's and no unit's.
+        assert_eq!(of(0, 0), ("ok", "host-a/-".to_string(), String::new()));
         assert_eq!(
             of(0x80 | 11, AXSIG | ACORE),
-            ("error", "killed by SIGSEGV".to_string(), "-".to_string())
+            (
+                "error",
+                "host-a/-".to_string(),
+                "killed by SIGSEGV".to_string()
+            )
         );
     }
 
