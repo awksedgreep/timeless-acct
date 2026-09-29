@@ -596,8 +596,9 @@ index of that store, and grows with it.
 
 | | |
 |---|---|
-| a series in the store | about 1.9 KB, for as long as the store keeps it |
-| a chunk, until it is merged | about 220 bytes; a flush writes one for each series with samples, which was 1.2 MB a minute |
+| a series in the store | about 1.4 KB, for as long as the store keeps it |
+| a chunk | about 225 bytes; a flush writes one for each series with samples, which was 1.2 MB a minute, until compaction merges them |
+| a series that has ended, with the two or three chunks left of it | about 1.9 KB |
 | a maintenance pass | up to 130 MB while it runs, given back when it ends |
 
 A process that lives for thirty seconds is fifteen series, so the number
@@ -605,7 +606,8 @@ of series is the number of processes there have been, and not the number
 there are. The workstation above made between 1,000 and 4,000 series an
 hour. At 1.9 KB each that is 50 to 180 MB a day, for the thirty days raw
 samples are kept. That figure is worked out from an hour and a half, not
-measured over a month.
+measured over a month. It is the engine's to change:
+[timeless-libsql#82](https://github.com/awksedgreep/timeless-libsql/issues/82).
 
 Half the series of that store never held a value but zero: a process that
 never swapped, never faulted a page in from disk, never read or wrote.
@@ -692,7 +694,8 @@ sends them, in order and at the times they were taken, when it answers.
   [what the store costs in memory](#what-the-store-costs-in-memory).
 - **The end of a series.** Nothing marks a process's series as over, so a
   reader has to be told how far back to look: see
-  [Reading with PromQL](#reading-with-promql).
+  [Reading with PromQL](#reading-with-promql). It takes the plane as well:
+  [timeless-libsql#83](https://github.com/awksedgreep/timeless-libsql/issues/83).
 - **Fans and batteries** are collected where the kernel has them, and were
   tested against a host that has neither.
 - **Proportional memory** (PSS). `proc_rss_bytes` counts shared pages once

@@ -558,11 +558,13 @@ in one half minute and stayed there; asked to give back what it held
 free, it was 189.
 
 What is left is the engine's own. It holds every series of the store in
-memory, at about 1.9 KB each, measured on stores of 15,000, 60,000, and
-240,000 series. And it holds an entry for each chunk, of which every flush
-writes one for each series that has samples: about 1.2 MB a minute on the
-development host, until the next compaction merges them. See "What is not
-here yet".
+memory, at about 1.4 KB each, and an entry of about 225 bytes for each
+chunk: measured on one set of 30,000 series stored as 57,000 chunks, and
+as 150,000, 450,000, and 900,000. Every flush writes a chunk for each
+series that has samples, which was 1.2 MB a minute on the development
+host, until the next compaction merges them. A series that has ended is
+left with two or three, and costs about 1.9 KB. See "What is not here
+yet".
 
 ### One thing differs on purpose
 
