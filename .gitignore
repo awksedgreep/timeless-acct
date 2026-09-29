@@ -1,0 +1,8 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+*.lock
+!Cargo.lock
+# The default store, for a collector run from here.
+/timeless-acct-data/

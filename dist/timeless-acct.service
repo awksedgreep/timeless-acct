@@ -1,0 +1,60 @@
+# timeless-acct as a system service.
+#
+#   sudo install -m 0755 target/release/timeless-acct /usr/local/bin/
+#   sudo install -m 0644 dist/timeless-acct.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now timeless-acct
+#
+# It runs as an unprivileged user that holds exactly three capabilities, and
+# `timeless-acct check` says what each one buys:
+#
+#   CAP_NET_ADMIN          exit records from the kernel, and word of each exec
+#   CAP_SYS_PTRACE         the I/O, open files, and executable of processes
+#   CAP_DAC_READ_SEARCH    that belong to other users; it takes both
+#
+# Exit accounting is only offered to the initial user and PID namespaces, so
+# the unit must not set PrivateUsers= or run inside a container.
+
+[Unit]
+Description=timeless-acct: system and process accounting history
+Documentation=https://github.com/awksedgreep/timeless-acct
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# To the Timeless planes, which is what the canvas reads.
+ExecStart=/usr/local/bin/timeless-acct run --sink http
+# Or to a store of its own, under /var/lib/timeless-acct:
+#ExecStart=/usr/local/bin/timeless-acct run --sink embedded --data-dir %S/timeless-acct
+
+#Environment=TIMELESS_ACCT_METRICS_URL=http://127.0.0.1:8428
+#Environment=TIMELESS_ACCT_LOGS_URL=http://127.0.0.1:9428
+#Environment=TIMELESS_ACCT_TRACES_URL=http://127.0.0.1:10428
+# A bearer token, for planes that require one: TIMELESS_ACCT_TOKEN=...
+#EnvironmentFile=-/etc/timeless-acct.env
+
+DynamicUser=yes
+StateDirectory=timeless-acct
+# A store holds what every process on the host was run with.
+StateDirectoryMode=0700
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+
+# It reads the whole system and writes only its own state.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Time to flush and checkpoint.
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
