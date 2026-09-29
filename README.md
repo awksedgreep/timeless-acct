@@ -144,6 +144,34 @@ and for one process:
 A unit is the same line after a restart. A process is a new one, because
 it is a new process. The timeline scrubber does the rest.
 
+These are the shortest way to name a line, and not the only one. Any label
+can be a field of an element: `comm` = `postgres` beside `proc_cpu_pct` is
+every postgres process, and `kind` = `service` beside a `unit_*` metric is
+every unit that does not hold other units.
+
+#### Reading with PromQL
+
+Pass `lookback_delta` of two or three times `--process-interval`: `30s`,
+for the default of ten seconds.
+
+```sh
+curl -G http://127.0.0.1:8428/api/v1/query \
+  --data-urlencode 'query=sum by (comm) (proc_rss_bytes)' \
+  --data-urlencode 'lookback_delta=30s'
+```
+
+PromQL takes the last sample of each series within its lookback, which is
+five minutes unless it is told otherwise. A process that has ended writes
+no more samples, and its last one goes on being its value until the
+lookback has passed it. Anything that adds up or ranks the `proc_*` tier
+counts the dead among the living for that long: on one workstation, the
+memory of a browser that restarts its processes was 7.7 GB by the default
+and 4.7 GB by `30s`, and the count of processes was 207, where the
+collector had reported 201.
+
+A lookback shorter than the interval finds nothing between two samples.
+The viewer and `timeless-acct top` use thirty seconds.
+
 A host element turns red when a process on the host dies of a fault, and
 amber when one is killed; see
 [the level of a record](DESIGN.md#the-level-is-a-judgement-about-the-host).
@@ -258,7 +286,13 @@ of a command, of a user, or of a unit.
 ### Units: `unit_*`
 
 For each systemd service, scope, and slice that has anything running in
-it. Label: `unit`.
+it. Labels: `unit`, and `kind`.
+
+| `kind` | is |
+|---|---|
+| `service`, `scope` | a unit that is only itself |
+| `slice` | a slice: the sum of the units in it |
+| `manager` | a user's manager, `user@1000.service`: the sum of every unit that user runs |
 
 These are the kernel's own accounts of each control group, not sums over
 processes: they hold everything that ran in the unit, including what
@@ -301,7 +335,9 @@ the control group tree, where the container's own group sits inside the
 unit's; the container runtime is not asked.
 
 A slice is reported beside the units in it, so `system.slice` and
-`user.slice` are the two halves of the host.
+`user.slice` are the two halves of the host. Ranked by size, the slices
+and the managers come first, above what they are the sum of; `kind` is
+for leaving them out.
 
 The kernel keeps a unit's I/O only where the I/O controller is on, which
 for a user's units it is not by default. There, I/O is added up from the
@@ -544,7 +580,7 @@ between 13 and 30 processes ending every second.
 | | |
 |---|---|
 | collector CPU | 0.65% of one CPU. A sweep of 530 processes and 74 units takes 25 ms |
-| collector memory | about 45 MB resident |
+| collector memory | 60 to 115 MB resident with 11,000 series in the store, and more with more: see [below](#what-the-store-costs-in-memory) |
 | samples | 4,800 a tick: 2,600 of processes, 1,100 of units, 700 of totals, 400 of the system |
 | on the wire, to the planes | 470 KB a tick, uncompressed |
 | accounting records, stored | 33 to 39 bytes each, from 760 to 1,050 before compression |
@@ -552,6 +588,31 @@ between 13 and 30 processes ending every second.
 
 A day at that rate is 41 million samples, and between one and two and a
 half million accounting records and as many spans.
+
+### What the store costs in memory
+
+With a store of its own, the collector's memory is mostly the engine's
+index of that store, and grows with it.
+
+| | |
+|---|---|
+| a series in the store | about 1.9 KB, for as long as the store keeps it |
+| a chunk, until it is merged | about 220 bytes; a flush writes one for each series with samples, which was 1.2 MB a minute |
+| a maintenance pass | up to 130 MB while it runs, given back when it ends |
+
+A process that lives for thirty seconds is fifteen series, so the number
+of series is the number of processes there have been, and not the number
+there are. The workstation above made between 1,000 and 4,000 series an
+hour. At 1.9 KB each that is 50 to 180 MB a day, for the thirty days raw
+samples are kept. That figure is worked out from an hour and a half, not
+measured over a month.
+
+Half the series of that store never held a value but zero: a process that
+never swapped, never faulted a page in from disk, never read or wrote.
+They are stored all the same, so that a reader is told nothing happened
+and does not have to infer it.
+
+Pushing to the planes moves all of this to the planes.
 
 ### What a sample costs to store
 
@@ -627,6 +688,11 @@ sends them, in order and at the times they were taken, when it answers.
 - **Jobs longer than an hour.** What a job starts after its first hour is
   a trace of its own, and a job that has been running for longer is not
   among the jobs that are running.
+- **A bound on memory**, with a store of its own. See
+  [what the store costs in memory](#what-the-store-costs-in-memory).
+- **The end of a series.** Nothing marks a process's series as over, so a
+  reader has to be told how far back to look: see
+  [Reading with PromQL](#reading-with-promql).
 - **Fans and batteries** are collected where the kernel has them, and were
   tested against a host that has neither.
 - **Proportional memory** (PSS). `proc_rss_bytes` counts shared pages once

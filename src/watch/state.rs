@@ -3,6 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::data::{Process, Snapshot, Unit};
+use crate::cgroup::is_sum;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -428,14 +429,6 @@ impl State {
     }
 }
 
-/// Whether a unit is made of other units: a slice, or a user's manager.
-/// Its figures are the sum of theirs, and at the top of a list of units by
-/// size it says what the rest of the list says again.
-pub fn is_sum(unit: &str) -> bool {
-    let name = unit.rsplit('/').next().unwrap_or(unit);
-    name.ends_with(".slice") || (name.starts_with("user@") && name.ends_with(".service"))
-}
-
 fn total(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     match (a, b) {
         (None, None) => None,
@@ -634,11 +627,6 @@ mod tests {
         assert_eq!(state.units(&snapshot).len(), 6);
         press(&mut state, "a");
         assert_eq!(state.units(&snapshot).len(), 3);
-
-        assert!(is_sum("system.slice"));
-        assert!(is_sum("mark/app-graphical.slice"));
-        assert!(!is_sum("getty@tty1.service"));
-        assert!(!is_sum("mark/slice-of-life.service"));
     }
 
     #[test]

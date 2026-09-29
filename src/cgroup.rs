@@ -28,6 +28,30 @@ pub fn kind(component: &str) -> Option<Kind> {
     }
 }
 
+/// What a reported unit is, for the `kind` label: `service`, `scope`,
+/// `slice`, or `manager`.
+///
+/// A slice's figures are the sum of the units in it, and so are those of
+/// a user's manager, `user@1000.service`, which is a service by its name
+/// and holds every unit that user runs. A reader who ranks units wants
+/// neither among them, and can only ask for what a label equals.
+pub fn unit_kind(unit: &str) -> &'static str {
+    let name = unit.rsplit('/').next().unwrap_or(unit);
+    match kind(name) {
+        Some(Kind::Slice) => "slice",
+        Some(Kind::Scope) => "scope",
+        Some(Kind::Service) if name.starts_with("user@") => "manager",
+        Some(Kind::Service) | None => "service",
+    }
+}
+
+/// Whether a unit is made of other units. At the top of a list of units by
+/// size it says what the rest of the list says again.
+#[cfg(any(feature = "watch", test))]
+pub fn is_sum(unit: &str) -> bool {
+    matches!(unit_kind(unit), "slice" | "manager")
+}
+
 /// The control group of a process, from `/proc/<pid>/cgroup`: the path on
 /// the unified hierarchy's line, `0::/system.slice/sshd.service`.
 pub fn parse_proc_cgroup(text: &str) -> Option<&str> {
@@ -305,6 +329,25 @@ pub fn parse_io_stat(text: &str) -> Vec<DeviceIo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_unit_is_of_one_kind() {
+        assert_eq!(unit_kind("sshd.service"), "service");
+        assert_eq!(unit_kind("getty@tty1.service"), "service");
+        assert_eq!(unit_kind("mark/app-term.scope"), "scope");
+        assert_eq!(unit_kind("system.slice"), "slice");
+        assert_eq!(unit_kind("mark/app-graphical.slice"), "slice");
+        assert_eq!(unit_kind("user@1000.service"), "manager");
+        // By its name, and not by a word in it.
+        assert_eq!(unit_kind("mark/slice-of-life.service"), "service");
+
+        for unit in ["user.slice", "mark/app.slice", "user@1000.service"] {
+            assert!(is_sum(unit), "{unit}");
+        }
+        for unit in ["getty@tty1.service", "mark/app-term.scope"] {
+            assert!(!is_sum(unit), "{unit}");
+        }
+    }
 
     fn named(uid: u32) -> String {
         match uid {

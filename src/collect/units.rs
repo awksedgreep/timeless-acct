@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::cgroup::{kind, parse_io_stat, unit_name, Containers};
+use crate::cgroup::{kind, parse_io_stat, unit_kind, unit_name, Containers};
 use crate::collect::percent;
 use crate::collect::process::GroupUse;
 use crate::model::{labels, Labels, MetricBatch};
@@ -200,7 +200,12 @@ impl UnitCollector {
             let label = self
                 .labels
                 .entry(name.clone())
-                .or_insert_with(|| labels(vec![("unit", name.clone())]))
+                .or_insert_with(|| {
+                    labels(vec![
+                        ("unit", name.clone()),
+                        ("kind", unit_kind(name).to_string()),
+                    ])
+                })
                 .clone();
             let l = &label;
 
@@ -763,6 +768,56 @@ mod tests {
                 assert_eq!(value(&batch, "unit_cpu_pct", "db.service"), Some(40.0));
             }
         }
+    }
+
+    #[test]
+    fn a_unit_says_what_kind_it_is() {
+        let fixture = fixture("units_kinds");
+        let mut collector = UnitCollector::new(fixture.root()).unwrap();
+        let scope = format!("{USER}/app.slice/app-term-0a1b2c3d.scope");
+        for path in [
+            "system.slice",
+            "system.slice/db.service",
+            "user.slice",
+            USER,
+            scope.as_str(),
+        ] {
+            write(
+                &fixture,
+                &Group {
+                    path,
+                    ..Group::default()
+                },
+            );
+        }
+        let mut batch = MetricBatch::new(0);
+        collector.collect(Instant::now(), &HashMap::new(), &mut batch);
+
+        // The unit whose name ends so, and the kind it is said to be.
+        let kind = |ending: &str| -> Vec<&str> {
+            let mut kinds: Vec<&str> = batch
+                .samples
+                .iter()
+                .filter(|s| s.name == "unit_tasks")
+                .filter(|s| {
+                    s.labels
+                        .iter()
+                        .any(|(k, v)| *k == "unit" && v.ends_with(ending))
+                })
+                .flat_map(|s| s.labels.iter())
+                .filter(|(k, _)| *k == "kind")
+                .map(|(_, v)| v.as_str())
+                .collect();
+            kinds.sort_unstable();
+            kinds
+        };
+        assert_eq!(kind("db.service"), ["service"]);
+        assert_eq!(kind("app-term.scope"), ["scope"]);
+        assert_eq!(kind("system.slice"), ["slice"]);
+        assert_eq!(kind("user.slice"), ["slice"]);
+        // A service by its name, and the sum of a user's units by what
+        // the kernel counts in it.
+        assert_eq!(kind("user@0.service"), ["manager"]);
     }
 
     #[test]

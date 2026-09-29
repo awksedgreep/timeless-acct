@@ -14,10 +14,16 @@ design.
 
 ## 1. The canvas decides the shape of a metric
 
-A canvas element selects a series by **host, metric name, and at most one
+A canvas element names a line most easily by **host, metric name, and one
 more label**, and it draws **the last value in each time bucket**. It treats
 a series as a counter only if it carries SNMP-style type metadata, which
 nothing pushed over the Prometheus import route does.
+
+One more label is what is easiest, and not all an element can have. Every
+field of an element that does not configure it is sent as a label filter,
+choosing a series from the list writes all of that series' labels into the
+element, and a canvas variable adds its own. An earlier version of this
+document said "at most one", and was wrong.
 
 So:
 
@@ -35,9 +41,16 @@ interval is a sixth as tall. Rollups then average those.
 
 **Names are flat, and a label is what varies.** CPU modes are separate
 metrics (`sys_cpu_user_pct`, `sys_cpu_iowait_pct`), not a `mode` label,
-because `sys_cpu_pct{cpu="3",mode="user"}` needs two labels to name one line
-and an element has one. Every metric here differs from its siblings by one
-label at most: `cpu`, `dev`, `iface`, `mount`, `proc`, `comm`, or `user`.
+because `sys_cpu_pct{cpu="3",mode="user"}` needs two labels to name one line,
+and a list of names that each mean one thing is easier to read than a list
+of one name with its modes. Every metric here differs from its siblings by
+one label at most: `cpu`, `dev`, `iface`, `mount`, `proc`, `comm`, `user`,
+or `unit`.
+
+**A label beside that one says what kind of line it is, and never which.**
+`pid`, `comm`, and `user` on a process, and `kind` on a unit, are there to
+be filtered by. Equality is all that an element, and the metrics plane's
+own range route, can ask of a label.
 
 **`proc` names a process in one label.** `proc="postgres[1234]"` is what an
 element selects. `pid`, `comm`, and `user` are on the same series so that a
@@ -97,6 +110,19 @@ figure was never lost.
 The accounts are also hierarchical, so a slice is read and not added up.
 `system.slice` and `user.slice` are the two halves of the host, from two
 files.
+
+That is also why a list of units by size begins with what holds units.
+On the development host the first five rows of `unit_memory_bytes` were
+`user.slice`, `user-1000.slice`, `user@1000.service`, and two slices of
+that user's, before the first application. The figures are right, and the
+list says the same thing five times.
+
+So every unit series has a `kind`: `service`, `scope`, `slice`, or
+`manager`. A user's manager, `user@1000.service`, is a service by its name
+and holds every unit the user runs, as a slice does, and no pattern over
+names tells it from `getty@tty1.service`. It is a kind of its own, so that
+`kind="service"` means a service that is only itself. The viewer leaves
+out the same two kinds, by the same rule.
 
 One account is not always kept. A group's I/O is counted only where the
 I/O controller is enabled, and systemd does not enable it for a user's
@@ -509,6 +535,35 @@ reports no error. The store was compacted and the file did not shrink:
 3,817 of its 4,597 pages were free. Asked for every row, the same file
 went from 18.8 MB to 5.1.
 
+### And so is what it was written through, and what it was done in
+
+A maintenance pass rewrites much of a store, and all of it goes through
+the write-ahead log. SQLite checkpoints a log and then writes over it from
+the start; it does not make the file smaller. An hour and a half after it
+began, the development host's store was 47 MB of databases and 95 MB of
+logs, each log about 30 MB, with between 193 and 1,310 pages in use.
+Checkpoints had kept up. The files were the size of the largest pass.
+
+The same is true of memory. Compacting that store took the collector from
+15 MB to 143, and glibc kept what was freed for the next allocation of
+that size, which is an hour away. The collector stayed at 143 MB.
+
+After a pass, each log is checkpointed and cut to nothing, and what the
+allocator holds free is given back to the kernel: 143 MB became 59. A log
+is also limited to 8 MB of what it grew to, where the planes allow 64.
+
+Memory is given back after every flush as well. While a C build ended
+62,000 processes in twelve minutes, the collector went from 124 MB to 367
+in one half minute and stayed there; asked to give back what it held
+free, it was 189.
+
+What is left is the engine's own. It holds every series of the store in
+memory, at about 1.9 KB each, measured on stores of 15,000, 60,000, and
+240,000 series. And it holds an entry for each chunk, of which every flush
+writes one for each series that has samples: about 1.2 MB a minute on the
+development host, until the next compaction merges them. See "What is not
+here yet".
+
 ### One thing differs on purpose
 
 `PRAGMA auto_vacuum` can only be chosen while
@@ -629,20 +684,38 @@ blocking, with a timeout shorter than the interval.
 
 Ordered by how much each would add.
 
-1. **Containers that no unit runs.** One started by hand is in a scope
+1. **A bound on memory.** The engine holds every series of a store in
+   memory, and a process is fifteen new ones. Two things would help, and
+   neither is done. A process could be given series of its own later than
+   thirty seconds into its life: 41% of those that ended had lived for
+   less than five minutes. And the engine could keep in memory only the
+   series being written, which is the engine's to do.
+
+   Half of all series never hold a value but zero, and they are kept on
+   purpose. A series that says nothing happened is an answer, and one
+   that is absent is a question; its samples compress to almost nothing.
+   What it costs is what any series costs, in the index and for each
+   chunk.
+2. **The end of a series.** Prometheus marks a series as over with a value
+   that is not a number, and a reader stops at it. Here a reader is told
+   how far back to look. It takes the collector and the plane both: the
+   collector drops what is not finite before it is stored, and the metrics
+   plane was found to know the marker on its MetricsQL route and not on
+   its PromQL one.
+3. **Containers that no unit runs.** One started by hand is in a scope
    named for its id and nothing else. Its name is known to the runtime
    alone, so naming it means asking: reading podman's or docker's state,
    which differs by runtime and by version, and takes being allowed to.
-2. **Units where systemd does not name them**: Docker with its own control
+4. **Units where systemd does not name them**: Docker with its own control
    group driver, Kubernetes. The accounts are the same files; what differs
    is how a group's path is turned into a name.
-3. **A trace's resources, while it runs.** A span is written when its
+5. **A trace's resources, while it runs.** A span is written when its
    process ends, so a build is drawn when it is over. The processes of a
    job that is still running are known, and could be listed.
-4. **Memory by proportional set size**, from `smaps_rollup`. Resident size
+6. **Memory by proportional set size**, from `smaps_rollup`. Resident size
    counts shared pages once per process that maps them, so a forking server
    looks larger than it is. It costs a page-table walk per process per
    sweep, so it would be opt-in. For a unit, `unit_memory_bytes` already
    counts each page once.
-5. **The binary batch format** for the embedded sink, if ingest cost ever
+7. **The binary batch format** for the embedded sink, if ingest cost ever
    shows up in a profile.

@@ -32,6 +32,9 @@ const OPTIMIZE_BUDGET: u32 = 65_536;
 /// Free pages one maintenance pass may return: a bound on the time it holds
 /// the database, at 4 KiB a page.
 const VACUUM_PAGES: u32 = 16_384;
+/// What a write-ahead log may keep of the size it once grew to. A
+/// maintenance pass writes tens of megabytes; a tick writes a few pages.
+const WAL_KEPT: u32 = 8 << 20;
 /// The owner lease the signal servers take, relative to the database.
 const LEASE_SUFFIX: &str = ".timeless-api.lock";
 
@@ -106,15 +109,15 @@ pub fn open(path: &Path) -> Result<Connection> {
     if path.file_name().is_some_and(|name| name == TRACES_DB) {
         connection.execute_batch("PRAGMA page_size = 16384;")?;
     }
-    connection.execute_batch(
+    connection.execute_batch(&format!(
         "PRAGMA auto_vacuum = INCREMENTAL;
          PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA wal_autocheckpoint = 1000;
-         PRAGMA journal_size_limit = 67108864;
+         PRAGMA journal_size_limit = {WAL_KEPT};
          PRAGMA temp_store = MEMORY;
-         PRAGMA busy_timeout = 5000;",
-    )?;
+         PRAGMA busy_timeout = 5000;"
+    ))?;
     timeless_ext::register_telemetry(&connection)
         .map_err(|error| anyhow!("register the timeless engine: {error}"))?;
 
@@ -128,6 +131,22 @@ pub fn open(path: &Path) -> Result<Connection> {
         );
     }
     Ok(connection)
+}
+
+/// Give the kernel back what was used and freed.
+///
+/// Compaction decodes and rewrites much of a store at once, and a burst
+/// of processes ending is held until it is flushed: either is a heap
+/// several times the size the collector otherwise runs in. glibc keeps
+/// what is freed for the next allocation of that size, which may be an
+/// hour away, or never come.
+fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim takes no pointer and leaves every allocation
+    // as it was.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 pub struct EmbeddedSink {
@@ -276,7 +295,11 @@ impl Sink for EmbeddedSink {
     fn flush(&mut self) -> Result<()> {
         Self::command(&self.metrics, METRICS_TABLE, "flush")?;
         Self::command(&self.logs, LOGS_TABLE, "flush")?;
-        Self::command(&self.traces, TRACES_TABLE, "flush")
+        Self::command(&self.traces, TRACES_TABLE, "flush")?;
+        // What was waiting to be written is written. A build that ends
+        // five thousand processes in a minute leaves that much behind.
+        release_freed_memory();
+        Ok(())
     }
 
     fn maintain(&mut self) -> Result<()> {
@@ -302,7 +325,14 @@ impl Sink for EmbeddedSink {
                 connection.prepare(&format!("PRAGMA incremental_vacuum({VACUUM_PAGES})"))?;
             let mut freed = vacuum.query([])?;
             while freed.next()?.is_some() {}
+            drop(freed);
+            drop(vacuum);
+            // All of that went through the write-ahead log, which keeps
+            // the size it grew to until it is cut back. A reader in the
+            // way leaves it for the next pass.
+            connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         }
+        release_freed_memory();
         Ok(())
     }
 
@@ -565,6 +595,10 @@ mod tests {
         assert_eq!(pages(&sink, "freelist_count"), 0);
         let after = pages(&sink, "page_count");
         assert!(after * 2 < before, "{after} pages, of {before} before");
+
+        // And the log it was all written through holds none of it.
+        let log = fixture.path("data").join("metrics.db-wal");
+        assert_eq!(fs::metadata(&log).unwrap().len(), 0);
 
         let points: i64 = sink
             .metrics
