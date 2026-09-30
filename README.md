@@ -20,7 +20,15 @@ It stores them in timeless-libsql, so they can be put on a
 timeline dragged back: what was this host doing, and which process was
 doing it, at 03:12 last Tuesday.
 
-And it can be watched where it is, in a terminal, with the same timeline:
+And it can be watched where it is, in a terminal, with the same timeline.
+Here it goes back to a CPU spike from the evening before, steps across
+it, finds the compiler that caused it among the processes that ended, and
+comes back to now:
+
+![The viewer going back to a CPU spike, finding the process behind it, and returning to now](docs/rewind.gif)
+
+That is the viewer on a real store, recorded by
+[`tools/demo/rewind.sh`](tools/demo/rewind.sh). A screen of it, as text:
 
 ```text
 $ timeless-acct watch
