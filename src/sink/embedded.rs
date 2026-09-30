@@ -140,7 +140,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// several times the size the collector otherwise runs in. glibc keeps
 /// what is freed for the next allocation of that size, which may be an
 /// hour away, or never come.
-fn release_freed_memory() {
+pub(crate) fn release_freed_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: malloc_trim takes no pointer and leaves every allocation
     // as it was.

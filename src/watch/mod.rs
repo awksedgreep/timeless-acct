@@ -10,6 +10,7 @@ mod state;
 mod store;
 mod view;
 
+use std::collections::HashSet;
 use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
 
@@ -32,16 +33,17 @@ use crate::model::MetricBatch;
 use crate::procfs::process::parse_pid_stat;
 use crate::procfs::system::parse_stat;
 use crate::procfs::ProcRoot;
+use crate::sink::embedded::release_freed_memory;
 use crate::taskstats::epoch_now;
 
 use data::{Sampled, Snapshot};
 use state::{Changed, State, Tab};
-use store::{Reach, Store};
+use store::{Reach, Store, SPACING};
 use view::{draw, history_of, Detail};
 
-/// How far back a series' last sample may be for the series to be there.
-/// Three of the store's samples: a process that has ended has none.
-const WITHIN: f64 = 30.0;
+/// How far back a series' last sample may be for the series to be there,
+/// in samples of the store: a process that has ended has none.
+const WITHIN: f64 = 3.0;
 /// How far back a row's history goes.
 const HISTORY: f64 = 600.0;
 /// How far back jobs and exits are looked for.
@@ -50,6 +52,9 @@ const ROWS: usize = 200;
 /// How long a job may have been running and still be one: the store's
 /// rule for what is one trace.
 const JOB: f64 = 3600.0;
+/// How long the first of a reading of the records may take before the
+/// screen is drawn with what it found.
+const FIRST_READING: Duration = Duration::from_millis(150);
 /// How long the timeline is kept before it is read again, while now is
 /// what is looked at.
 const TIMELINE: Duration = Duration::from_secs(10);
@@ -108,8 +113,33 @@ struct Watch {
     snapshot: Snapshot,
     detail: Detail,
     width: usize,
+    /// How far back a series' last sample may be, at the moment looked at.
+    within: f64,
     /// When the timeline was read, and of which stretch.
     timeline_read: Option<(Instant, (f64, f64))>,
+    /// The reading of the records that is under way, or done.
+    hunt: Option<Hunt>,
+}
+
+/// A reading of the records of processes that ended, back from a moment.
+///
+/// It is done a page at a time, between the keys: an hour in which a
+/// quarter of a million processes ended takes seconds to read, and the
+/// screen has what was found so far, and answers, while it is read.
+struct Hunt {
+    /// What it is a reading for, and up to when: for anything else, it is
+    /// begun again.
+    filter: String,
+    past: Option<f64>,
+    span: f64,
+    /// As far back as it goes, in microseconds.
+    from: i64,
+    /// Up to when the next page is, if there is one to read.
+    next: Option<i64>,
+    /// Up to when it has read, going forward. When now is what is looked
+    /// at, what has ended since is read, and the rest is kept.
+    newest: i64,
+    seen: HashSet<(i64, u64)>,
 }
 
 impl Watch {
@@ -120,7 +150,7 @@ impl Watch {
             "now" => None,
             text => Some(clock::parse(text, now)?),
         };
-        let mut state = State::new(at, 10.0);
+        let mut state = State::new(at, SPACING);
         state.tab = match args.view {
             crate::cli::WatchView::Units => Tab::Units,
             crate::cli::WatchView::Processes => Tab::Processes,
@@ -137,7 +167,9 @@ impl Watch {
             snapshot: Snapshot::default(),
             detail: Detail::default(),
             width: 100,
+            within: WITHIN * SPACING,
             timeline_read: None,
+            hunt: None,
         })
     }
 
@@ -145,11 +177,35 @@ impl Watch {
     fn read_moment(&mut self) {
         self.detail.now = epoch_now();
         self.detail.range = self.store.range();
+        self.pace();
         self.snapshot = match self.state.at {
             None => self.live.read(),
-            Some(at) => Snapshot::read(at, &mut self.store.at(at, WITHIN)),
+            Some(at) => Snapshot::read(at, &mut self.store.at(at, self.within)),
         };
         self.read_detail();
+    }
+
+    /// Keep the store's pace. A step in time is from one of its samples to
+    /// the next, and a series is there at a moment if it has a sample in
+    /// the few before it: of a store sampled every second as of one
+    /// sampled every minute.
+    fn pace(&mut self) {
+        let until = self
+            .state
+            .at
+            .or(self.detail.range.map(|(_, last)| last))
+            .unwrap_or(self.detail.now);
+        let (system, processes) = self.store.spacing(until);
+        let finest = match (system, processes) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b).unwrap_or(SPACING),
+        };
+        let coarsest = match (system, processes) {
+            (Some(a), Some(b)) => a.max(b),
+            (a, b) => a.or(b).unwrap_or(SPACING),
+        };
+        self.state.step = finest.max(1.0);
+        self.within = WITHIN * coarsest.max(1.0);
     }
 
     /// Read the timeline: how busy the host was, and what went wrong,
@@ -203,16 +259,16 @@ impl Watch {
         self.detail.step = self.state.step;
         // The quarter of an hour before; and, when something is looked
         // for, as far back as the timeline shows.
-        let reach = Reach {
-            until,
-            span: if self.state.is_looking() {
-                self.state.window().max(RECENT)
-            } else {
-                RECENT
-            },
-            limit: ROWS,
+        let span = if self.state.is_looking() {
+            self.state.window().max(RECENT)
+        } else {
+            RECENT
         };
-        let state = &self.state;
+        self.detail.reach = span;
+        if self.state.tab != Tab::Exits {
+            self.hunt = None;
+            self.detail.looking = None;
+        }
         match self.state.tab {
             Tab::Units | Tab::Processes => {
                 let rows = match self.state.tab {
@@ -227,30 +283,158 @@ impl Watch {
                     self.detail.history_of = title;
                 }
             }
-            Tab::Jobs => match self.store.jobs(reach, self.width, &|job| {
-                state.wants(&[&job.command, &job.unit])
-            }) {
-                Ok(ended) => {
-                    // What is running is first, while now is what is
-                    // looked at. At any other moment, what was running
-                    // then has ended since, or is among these still.
-                    let mut jobs = if self.state.is_live() {
-                        self.live.jobs(self.width)
-                    } else {
-                        Vec::new()
-                    };
-                    jobs.extend(ended);
-                    self.detail.jobs = jobs;
+            Tab::Jobs => {
+                let reach = Reach {
+                    until,
+                    span,
+                    limit: ROWS,
+                };
+                match self.store.jobs(reach, self.width, &self.state.filter) {
+                    Ok(ended) => {
+                        // What is running is first, while now is what is
+                        // looked at. At any other moment, what was running
+                        // then has ended since, or is among these still.
+                        let mut jobs = if self.state.is_live() {
+                            self.live.jobs(self.width)
+                        } else {
+                            Vec::new()
+                        };
+                        jobs.extend(ended);
+                        self.detail.jobs = jobs;
+                    }
+                    Err(error) => self.detail.error = Some(format!("{error:#}")),
                 }
-                Err(error) => self.detail.error = Some(format!("{error:#}")),
-            },
-            Tab::Exits => match self.store.exits(reach, &|exit| {
-                state.wants(&[&exit.command, &exit.unit, &exit.status, &exit.user])
-            }) {
+                release_freed_memory();
+            }
+            Tab::Exits => self.read_exits(until, span),
+        }
+    }
+
+    /// Read the processes that ended: begin a reading, or, if now is what
+    /// is looked at and the reading is the same one, add what has ended
+    /// since.
+    fn read_exits(&mut self, until: f64, span: f64) {
+        let upto = (until * 1e6).floor() as i64;
+        let from = upto - (span * 1e6) as i64;
+        if self.state.filter.is_empty() {
+            // The last to end, and the store stops at a screen's worth.
+            self.hunt = None;
+            self.detail.looking = None;
+            match self.store.exits_latest(from, upto, ROWS) {
                 Ok(exits) => self.detail.exits = exits,
                 Err(error) => self.detail.error = Some(format!("{error:#}")),
-            },
+            }
+            self.store.release();
+            return;
         }
+
+        let same = self.hunt.as_ref().is_some_and(|hunt| {
+            self.state.is_live()
+                && hunt.past.is_none()
+                && hunt.filter == self.state.filter
+                && hunt.span == span
+        });
+        if same {
+            let Some(mut hunt) = self.hunt.take() else {
+                return;
+            };
+            // Since the last look at now: a stretch of seconds.
+            let state = &self.state;
+            match self
+                .store
+                .exits_page(hunt.newest, upto, ROWS, &hunt.filter, &|exit| {
+                    state.wants(&[&exit.command, &exit.unit, &exit.status, &exit.user])
+                }) {
+                Ok(page) => {
+                    hunt.newest = upto;
+                    self.keep(&mut hunt, page.found);
+                }
+                Err(error) => self.detail.error = Some(format!("{error:#}")),
+            }
+            self.hunt = Some(hunt);
+            return;
+        }
+
+        let mut hunt = Hunt {
+            filter: self.state.filter.clone(),
+            past: self.state.at,
+            span,
+            from,
+            next: Some(upto),
+            newest: upto,
+            seen: HashSet::new(),
+        };
+        self.detail.exits.clear();
+        // What a record says, the store looks for itself, over all of the
+        // stretch at once: the command's name, and how it ended. What it
+        // ran in full, and where, and as whom, is read for.
+        let said = self.store.exits_saying(&hunt.filter, from, upto, ROWS);
+        self.keep(&mut hunt, said);
+        self.detail.looking = Some(until);
+        self.hunt = Some(hunt);
+        // A moment's reading now, so that a screen is drawn full where it
+        // can be; the rest between the keys.
+        let begun = Instant::now();
+        while self.hunt_on() && begun.elapsed() < FIRST_READING {}
+    }
+
+    /// Read the next page back, if there is one to read. False when the
+    /// reading is over.
+    fn hunt_on(&mut self) -> bool {
+        let Some(mut hunt) = self.hunt.take() else {
+            return false;
+        };
+        let Some(upto) = hunt.next.take() else {
+            self.hunt = Some(hunt);
+            return false;
+        };
+        let state = &self.state;
+        match self
+            .store
+            .exits_page(hunt.from, upto, ROWS, &hunt.filter, &|exit| {
+                state.wants(&[&exit.command, &exit.unit, &exit.status, &exit.user])
+            }) {
+            Ok(page) => {
+                self.keep(&mut hunt, page.found);
+                // Enough when a screen's worth is found and nothing later
+                // than the last of it is still unread.
+                let full = self.detail.exits.len() >= ROWS
+                    && self
+                        .detail
+                        .exits
+                        .last()
+                        .is_some_and(|last| page.reached as f64 / 1e6 <= last.at);
+                hunt.next = page.next.filter(|_| !full);
+                self.detail.looking = hunt.next.map(|_| page.reached as f64 / 1e6);
+            }
+            Err(error) => {
+                self.detail.error = Some(format!("{error:#}"));
+                self.detail.looking = None;
+            }
+        }
+        let going = hunt.next.is_some();
+        self.hunt = Some(hunt);
+        // A page of records is a fifth of a gigabyte while it is read.
+        self.store.release();
+        going
+    }
+
+    /// Put what was found among what is shown: the last to end first, and
+    /// each once.
+    fn keep(&mut self, hunt: &mut Hunt, found: Vec<store::Exit>) {
+        for exit in found {
+            if hunt.seen.insert(((exit.at * 1e6).round() as i64, exit.pid)) {
+                self.detail.exits.push(exit);
+            }
+        }
+        self.detail.exits.sort_by(|a, b| b.at.total_cmp(&a.at));
+        self.detail.exits.truncate(ROWS);
+    }
+
+    /// Read the records through to the end: for a screen that is drawn
+    /// once.
+    fn settle(&mut self) {
+        while self.hunt_on() {}
     }
 }
 
@@ -362,7 +546,7 @@ impl Watch {
                 .detail
                 .jobs
                 .iter()
-                .filter(|job| self.state.wants(&[&job.command, &job.unit]))
+                .filter(|job| self.state.wants(&[&job.said]))
                 .nth(selected)
                 .map(|job| job.started),
             Tab::Units | Tab::Processes => None,
@@ -491,12 +675,18 @@ pub fn watch(args: &WatchArgs) -> Result<()> {
             draw(frame, &mut watch.state, &watch.snapshot, &watch.detail);
         })?;
 
-        let wait = if watch.state.is_live() {
-            refresh.saturating_sub(read_at.elapsed())
+        // While the records are being read, a key is looked for and not
+        // waited for.
+        let wait = if watch.detail.looking.is_some() {
+            Duration::ZERO
+        } else if watch.state.is_live() {
+            refresh
+                .saturating_sub(read_at.elapsed())
+                .max(Duration::from_millis(20))
         } else {
             Duration::from_secs(1)
         };
-        if event::poll(wait.max(Duration::from_millis(20)))? {
+        if event::poll(wait)? {
             // Every key that is waiting, before anything is read: holding
             // an arrow down goes through time without reading each moment
             // passed on the way.
@@ -533,9 +723,14 @@ pub fn watch(args: &WatchArgs) -> Result<()> {
                     read_at = Instant::now();
                 }
             }
-        } else if watch.state.is_live() {
+        } else if watch.state.is_live() && read_at.elapsed() >= refresh {
             watch.read_moment();
             read_at = Instant::now();
+        } else if watch.hunt_on() {
+            // The next slice is read, and the screen drawn with it.
+        } else if watch.state.is_live() {
+            // Between a reading that has just ended and the next look at
+            // now.
         } else {
             // A moment in the past does not change. How long ago it was
             // does, and how far the store goes.
@@ -561,6 +756,7 @@ fn print(watch: &mut Watch, size: &str) -> Result<()> {
         std::thread::sleep(Duration::from_secs(1));
     }
     watch.read_moment();
+    watch.settle();
 
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal.draw(|frame| {

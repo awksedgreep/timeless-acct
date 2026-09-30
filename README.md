@@ -170,7 +170,8 @@ and 4.7 GB by `30s`, and the count of processes was 207, where the
 collector had reported 201.
 
 A lookback shorter than the interval finds nothing between two samples.
-The viewer and `timeless-acct top` use thirty seconds.
+The viewer uses three of the store's samples, however far apart they
+are; `timeless-acct top` takes `--within`, and sixty seconds unless told.
 
 A host element turns red when a process on the host dies of a fault, and
 amber when one is killed; see
@@ -195,6 +196,47 @@ timeless-traces-api libtimeless_ext.so /var/lib/timeless-acct/traces.db
 
 One owner at a time: a server and a collector cannot both hold a store, and
 whichever comes second is refused.
+
+### How often
+
+Every ten seconds, unless told otherwise: sar's default is every ten
+minutes.
+
+```sh
+timeless-acct run --interval 1 --process-interval 1     # every second
+timeless-acct run --interval 10 --process-interval 60   # processes by the minute
+```
+
+`--interval` is how often the system is read and `--process-interval` how
+often processes and units are; either may be any whole number of seconds
+from one up. Exit records are not affected: every process that ends is
+recorded whatever the interval, as it happens.
+
+A rate is taken over the interval, so a shorter one catches what a longer
+one averages away. Ten seconds of a core at 100% is 100% sampled every ten
+seconds, and 17% sampled every minute. On one workstation over the same
+four minutes, a browser's highest CPU was 134% sampled every second and
+32% sampled every forty. When a process pins a CPU for a few seconds,
+every second is what finds it, and the rewind then shows which process it
+was.
+
+What it costs:
+
+| every | collector CPU, measured on that workstation | samples, against every ten seconds |
+|---|---|---|
+| 1 s | 5% of one CPU | ten times as many |
+| 10 s | 0.65% | |
+| 40 s | 0.4% | a quarter |
+
+Storage follows the samples, though not one to one; what a sample costs
+is [measured below](#what-a-sample-costs-to-store) at ten seconds only.
+
+The viewer keeps pace with whatever the store was sampled at: a step in
+time is one sample, and a series is on the screen if it has one in the
+last three. Two things do not adjust themselves: `top --within`, which is
+sixty seconds unless told, and a PromQL reader's lookback, which should
+be two or three times the interval (see
+[Reading with PromQL](#reading-with-promql)).
 
 ## Privileges
 
@@ -473,7 +515,7 @@ the units and the processes is the selected row's last ten minutes.
 
 | key | |
 |---|---|
-| `←` `→` | ten seconds back, forward |
+| `←` `→` | one sample back, forward: ten seconds, unless the collector was told otherwise |
 | `,` `.` | a minute |
 | `<` `>` | ten minutes |
 | `[` `]` | an hour |
@@ -486,7 +528,7 @@ the units and the processes is the selected row's last ten minutes.
 | `tab`, `1` to `4` | the view |
 | `↑` `↓`, `j` `k` | the row |
 | `enter` | open the row: a unit into its processes, a process or an exit into what is known of it |
-| `esc` | back out of a unit |
+| `esc` | back: from what is looked for, then out of a unit, then out of the viewer |
 | `s` | sort by cpu, memory, i/o, name |
 | `a` | show slices too |
 | `/` | show only what matches |
@@ -501,7 +543,16 @@ it; or finding it among the exits, with `/` and `SIGSEGV`, and pressing
 `/` looks for what matches, in what is on the screen as it is typed, and
 with `enter` in the store as far back as the timeline shows: a busy host
 ends hundreds of processes a minute, and the one looked for is seldom
-among the last few.
+among the last few. An exit matches by what it ran, how it ended, its
+unit, or its user; a job, by any of those of any process in it, so a
+build is found by its compiler.
+
+What matches by the command's name or by how it ended is on the screen at
+once. The rest is read for, a page of records at a time, and the screen
+says how far back it has read and answers keys while it does: over an
+hour in which a quarter of a million processes ended, seven seconds if
+there is nothing to find, and less than one if there is a screen's worth.
+`esc` puts all of them back.
 
 The jobs that are running are first among the jobs, while now is what is
 looked at, with how long each has taken so far.
@@ -573,6 +624,41 @@ SELECT ts, value FROM metric_samples
 SELECT message FROM logs WHERE service = 'postgres' AND status = 'SIGKILL';
 ```
 
+The store is three databases, one for each kind of data, laid out as the
+planes lay out theirs. One query can read all three: open one and attach
+the others.
+
+```sh
+sqlite3 'file:/var/lib/timeless-acct/metrics.db?mode=ro'
+```
+
+```sql
+.load libtimeless_ext
+ATTACH 'file:/var/lib/timeless-acct/logs.db?mode=ro' AS logs;
+ATTACH 'file:/var/lib/timeless-acct/traces.db?mode=ro' AS traces;
+
+-- Each unit at a moment: its CPU, and how many of its processes ended in
+-- the minute that followed, and how many of those failed.
+WITH cpu AS (
+  SELECT json_extract(labels, '$.unit') AS unit, value AS cpu_pct
+    FROM timeless_latest('metric_samples', 'unit_cpu_pct', NULL, 1790723880, 1790723910)
+), ended AS (
+  SELECT json_extract(metadata, '$.unit') AS unit,
+         count(*) AS ended, sum(status <> '0') AS failed
+    FROM logs.logs
+   WHERE ts BETWEEN 1790723880000000 AND 1790723940000000
+   GROUP BY 1
+)
+SELECT unit, round(cpu_pct, 1) AS cpu_pct, coalesce(ended, 0) AS ended, coalesce(failed, 0) AS failed
+  FROM cpu LEFT JOIN ended USING (unit)
+ ORDER BY cpu_pct DESC LIMIT 10;
+```
+
+Samples are in epoch seconds, records in microseconds, and spans in
+nanoseconds, as the planes keep them. A span's `service` is `host/unit`.
+Opening read-only (`mode=ro`) is what lets this run beside a collector
+that owns the store.
+
 ## Cost
 
 Measured at the default intervals, on a 22-CPU workstation running a
@@ -592,6 +678,36 @@ between 13 and 30 processes ending every second.
 A day at that rate is 41 million samples, and between one and two and a
 half million accounting records and as many spans.
 
+### What it adds up to
+
+How much smaller stored than written:
+
+| | written | stored | smaller by |
+|---|---:|---:|---:|
+| a sample, as sent to the planes | about 100 bytes of text | 1.1 to 3.5 bytes | 30 to 90 times |
+| a sample, as a timestamp and a value | 16 bytes | 1.1 to 3.5 bytes | 5 to 15 times |
+| an accounting record | 760 to 1,050 bytes | 33 to 39 bytes | 20 to 30 times |
+| a span | 820 bytes | 51 bytes | 16 times |
+
+And what that is on the workstation above, at the defaults. These are
+worked out from hours of data, not measured over months, and a server
+that ends fewer processes will be well under them.
+
+| | a day | kept for | levels off at |
+|---|---:|---:|---:|
+| samples, every ten seconds | 45 to 145 MB | 30 days | 1.4 to 4.3 GB |
+| samples, rolled up to five minutes | about 18 MB | 180 days | about 3.3 GB |
+| samples, rolled up to an hour | about 15 MB | forever | it does not |
+| accounting records | 36 to 90 MB | 90 days | 3.2 to 8 GB |
+| spans | 51 to 128 MB | 30 days | 1.5 to 3.8 GB |
+| **all of it** | **170 to 400 MB** | | **9 to 19 GB after 180 days, then 20 to 30 MB a day** |
+
+For a sense of scale: a week of every process on a busy workstation,
+sampled every ten seconds, is 1.2 to 2.8 GB, and its samples alone 0.3 to
+1 GB. The rollups cost more than they should, at one small chunk per
+series per hour; that is
+[timeless-libsql#81](https://github.com/awksedgreep/timeless-libsql/issues/81).
+
 ### What the store costs in memory
 
 With a store of its own, the collector's memory is mostly the engine's
@@ -599,7 +715,7 @@ index of that store, and grows with it.
 
 | | |
 |---|---|
-| a series in the store | about 1.4 KB, for as long as the store keeps it |
+| a series in the store | about 1.4 KB, and the engine keeps a series after its samples are gone |
 | a chunk | about 225 bytes; a flush writes one for each series with samples, which was 1.2 MB a minute, until compaction merges them |
 | a series that has ended, with the two or three chunks left of it | about 1.9 KB |
 | a maintenance pass | up to 130 MB while it runs, given back when it ends |
@@ -607,8 +723,9 @@ index of that store, and grows with it.
 A process that lives for thirty seconds is fifteen series, so the number
 of series is the number of processes there have been, and not the number
 there are. The workstation above made between 1,000 and 4,000 series an
-hour. At 1.9 KB each that is 50 to 180 MB a day, for the thirty days raw
-samples are kept. That figure is worked out from an hour and a half, not
+hour. At 1.9 KB each that is 50 to 180 MB a day, and it does not level
+off at thirty days with the samples: retention removes a series' data and
+leaves the series. That figure is worked out from an hour and a half, not
 measured over a month. It is the engine's to change:
 [timeless-libsql#82](https://github.com/awksedgreep/timeless-libsql/issues/82).
 
@@ -656,8 +773,8 @@ minutes.
 |---|---|---|
 | `--sink` | `embedded` | `embedded`, `http`, or `stdout` |
 | `--host` | the hostname | the name this host is recorded under |
-| `--interval` | 10 | seconds between readings of the system |
-| `--process-interval` | 10 | seconds between sweeps of the processes |
+| `--interval` | 10 | seconds between readings of the system, from 1 |
+| `--process-interval` | 10 | seconds between sweeps of the processes, from 1 |
 | `--min-age` | 30 | seconds a process must have lived to get series of its own |
 | `--kernel-threads` | off | give kernel threads series of their own |
 | `--no-units` | | do not report units |
@@ -669,6 +786,9 @@ minutes.
 | `--log-retention` | `90d` | local store: how long accounting records are kept |
 | `--trace-retention` | `30d` | local store: how long spans are kept |
 | `--token` | | planes: a bearer token, if they require one |
+
+Sampling faster or slower, and what it costs, is under [How
+often](#how-often).
 
 Retention and rollups apply when a store is created. For the planes, they
 are the planes' own settings.

@@ -42,6 +42,12 @@ pub struct Detail {
     pub inspected: Option<(String, Vec<(&'static str, String)>)>,
     /// Seconds between the store's samples.
     pub step: f64,
+    /// How far back the records have been read so far, in epoch seconds,
+    /// while there is further to read: what is on the screen is what has
+    /// been found by then.
+    pub looking: Option<f64>,
+    /// How far back jobs and exits are looked for, in seconds.
+    pub reach: f64,
     /// What went wrong reading the store, if something did.
     pub error: Option<String>,
 }
@@ -88,7 +94,7 @@ pub fn draw(frame: &mut Frame, state: &mut State, snapshot: &Snapshot, detail: &
     .areas(frame.area());
 
     draw_header(frame, header, state, snapshot, detail);
-    draw_tabs(frame, tabs, state);
+    draw_tabs(frame, tabs, state, detail);
     match state.tab {
         Tab::Units | Tab::Processes => {
             let [table, history] =
@@ -327,7 +333,7 @@ pub fn marks(width: usize, from: f64, to: f64, cursor: f64, incidents: &[Inciden
     marks
 }
 
-fn draw_tabs(frame: &mut Frame, area: Rect, state: &State) {
+fn draw_tabs(frame: &mut Frame, area: Rect, state: &State, detail: &Detail) {
     let mut spans = Vec::new();
     for (index, tab) in Tab::ALL.into_iter().enumerate() {
         let text = format!(" {} {} ", index + 1, tab.title());
@@ -353,6 +359,12 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &State) {
         spans.push(Span::styled(
             format!("{}{}", state.filter, if state.typing { "▏" } else { "" }),
             WARN,
+        ));
+    }
+    if let (Tab::Exits, Some(reached)) = (state.tab, detail.looking) {
+        spans.push(Span::styled(
+            format!("   read back to {} …", &clock::format(reached)[11..]),
+            DIM,
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -453,6 +465,16 @@ fn draw_processes(frame: &mut Frame, area: Rect, state: &mut State, snapshot: &S
 
 /// The values of a history, one to a column, the latest at the right.
 ///
+/// A step in time, as a key is said to take it: `10s`, `1s`, `2m`.
+fn pace(step: f64) -> String {
+    let seconds = step.round().max(1.0) as u64;
+    if seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 /// A sample stands until the next one is due, `step` seconds on, so a
 /// screen wider than the history is long has no holes in it. A column in
 /// which nothing was recorded, and nothing was standing, is empty: the
@@ -551,7 +573,7 @@ fn draw_jobs(frame: &mut Frame, area: Rect, state: &mut State, detail: &Detail) 
     let jobs: Vec<&Job> = detail
         .jobs
         .iter()
-        .filter(|job| state.wants(&[&job.command, &job.unit]))
+        .filter(|job| state.wants(&[&job.said]))
         .collect();
     state.clamp(jobs.len());
     let [list, tree] =
@@ -617,7 +639,18 @@ fn draw_jobs(frame: &mut Frame, area: Rect, state: &mut State, detail: &Detail) 
             })
             .collect(),
         None => vec![Line::styled(
-            "No jobs in the quarter of an hour before. A job is more than one process.",
+            if state.filter.is_empty() {
+                format!(
+                    "No jobs in the {} before. A job is more than one process.",
+                    human_duration(detail.reach)
+                )
+            } else {
+                format!(
+                    "No job with \"{}\" in it in the {} before.",
+                    state.filter,
+                    human_duration(detail.reach)
+                )
+            },
             DIM,
         )],
     };
@@ -647,6 +680,24 @@ fn draw_exits(frame: &mut Frame, area: Rect, state: &mut State, detail: &Detail)
             ])
         })
         .collect();
+    if rows.is_empty() && !state.typing {
+        // An empty table says nothing of why it is empty.
+        let why = match (state.filter.is_empty(), detail.looking) {
+            (false, Some(_)) => format!("Looking for \"{}\" …", state.filter),
+            (false, None) => format!(
+                "No process with \"{}\" in its record ended in the {} before.",
+                state.filter,
+                human_duration(detail.reach)
+            ),
+            (true, _) => format!(
+                "No process ended in the {} before.",
+                human_duration(detail.reach)
+            ),
+        };
+        state.clamp(0);
+        frame.render_widget(Paragraph::new(Line::styled(format!(" {why}"), DIM)), area);
+        return;
+    }
     table(
         frame,
         area,
@@ -691,13 +742,28 @@ fn draw_keys(frame: &mut Frame, area: Rect, state: &State, detail: &Detail) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
+    let step = pace(state.step);
     let keys: &[(&str, &str)] = if state.typing {
         &[("enter", "keep"), ("esc", "clear")]
+    } else if !state.filter.is_empty() {
+        &[
+            ("esc", "all of them again"),
+            ("/", "only"),
+            ("enter", "open"),
+            ("m", "its moment"),
+            ("←→", &step),
+            (",.", "1m"),
+            ("<>", "10m"),
+            ("t", "go to"),
+            ("l", "live"),
+            ("tab", "view"),
+            ("?", "help"),
+        ]
     } else if state.within.is_some() {
         &[
             ("esc", "back to units"),
             ("enter", "open"),
-            ("←→", "10s"),
+            ("←→", &step),
             (",.", "1m"),
             ("<>", "10m"),
             ("t", "go to"),
@@ -708,7 +774,7 @@ fn draw_keys(frame: &mut Frame, area: Rect, state: &State, detail: &Detail) {
         ]
     } else {
         &[
-            ("←→", "10s"),
+            ("←→", &step),
             (",.", "1m"),
             ("<>", "10m"),
             ("[]", "1h"),
@@ -932,6 +998,7 @@ mod tests {
             history_until: 1_753_000_290.0,
             step: 10.0,
             timeline_step: 10.0,
+            reach: 3600.0,
             ..Detail::default()
         }
     }
@@ -998,6 +1065,7 @@ mod tests {
             failed: 1,
             unit: "build.service".into(),
             command: "make all".into(),
+            said: "make all\ncc -c a.c".into(),
             running: false,
             tree: vec![
                 "make all  2.5s, cpu 500ms".into(),
@@ -1047,6 +1115,32 @@ mod tests {
         state.filter = "nothing-like-it".into();
         let text = screen(&mut state, &snapshot(), &detail);
         assert!(!text.contains("SIGSEGV"), "{text}");
+        // And says so, and what is on the keys for getting back.
+        assert!(
+            text.contains(
+                "No process with \"nothing-like-it\" in its record ended in the 1h00m before"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("esc all of them again"), "{text}");
+        // While the records are still being read, that is what it says.
+        detail.looking = Some(1_753_000_100.0);
+        let text = screen(&mut state, &snapshot(), &detail);
+        assert!(text.contains("Looking for \"nothing-like-it\""), "{text}");
+        assert!(text.contains("read back to"), "{text}");
+
+        // A job is found by anything that ran in it.
+        detail.looking = None;
+        state.tab = Tab::Jobs;
+        state.filter = "cc -c".into();
+        let text = screen(&mut state, &snapshot(), &detail);
+        assert!(text.contains("make all"), "{text}");
+        state.filter = "nothing-like-it".into();
+        let text = screen(&mut state, &snapshot(), &detail);
+        assert!(
+            text.contains("No job with \"nothing-like-it\" in it in the 1h00m before."),
+            "{text}"
+        );
     }
 
     #[test]

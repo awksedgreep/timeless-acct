@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::accounting::human_duration;
 use crate::query::{nodes, open, tree};
 use crate::sink::embedded::{
-    LOGS_DB, LOGS_TABLE, METRICS_DB, METRICS_TABLE, TRACES_DB, TRACES_TABLE,
+    release_freed_memory, LOGS_DB, LOGS_TABLE, METRICS_DB, METRICS_TABLE, TRACES_DB, TRACES_TABLE,
 };
 
 use super::data::{Series, Source};
@@ -52,6 +52,9 @@ pub struct Job {
     pub command: String,
     /// Its processes, drawn as the tree they were.
     pub tree: Vec<String>,
+    /// Everything in it that can be looked for: what each of its
+    /// processes ran, as whom, and where.
+    pub said: String,
     /// It has not ended: its figures are so far.
     pub running: bool,
 }
@@ -76,6 +79,12 @@ pub struct Reach {
     pub limit: usize,
 }
 
+/// How far apart samples are taken to be, of a store that has too few to
+/// say: the collector's own default.
+pub const SPACING: f64 = 10.0;
+const SPACING_NEAR: f64 = 300.0;
+const SPACING_FAR: f64 = 4.0 * 3600.0;
+
 pub struct Store {
     metrics: Connection,
     logs: Connection,
@@ -93,6 +102,18 @@ impl Store {
             traces: open(dir, TRACES_DB).ok(),
             host: host.map(|host| serde_json::json!({ "host": host }).to_string()),
         })
+    }
+
+    /// Give back what a reading took. SQLite keeps the pages it read, and
+    /// the allocator what was freed, until they are asked.
+    pub fn release(&self) {
+        for connection in [Some(&self.metrics), Some(&self.logs), self.traces.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = connection.execute_batch("PRAGMA shrink_memory;");
+        }
+        release_freed_memory();
     }
 
     /// The first and last moments the store holds samples of.
@@ -138,6 +159,46 @@ impl Store {
     ) -> Vec<(f64, f64)> {
         let mut filter = serde_json::Map::new();
         filter.insert(key.into(), want.into());
+        self.samples(metric, &Value::Object(filter).to_string(), from, to)
+    }
+
+    /// How far apart the store's samples are around a moment, in seconds:
+    /// of the system, and of processes and units. The collector is told
+    /// both when it is started, and a store does not say what it was told.
+    ///
+    /// The gap that half of the samples before the moment are no further
+    /// apart than: a tick that was missed, or a collector that was stopped
+    /// and started, is a gap and not the spacing.
+    pub fn spacing(&self, until: f64) -> (Option<f64>, Option<f64>) {
+        let of = |metric: &str, label: Option<(&str, &str)>| -> Option<f64> {
+            let mut filter = match &self.host {
+                Some(host) => serde_json::from_str(host).unwrap_or_default(),
+                None => serde_json::Map::new(),
+            };
+            if let Some((key, want)) = label {
+                filter.insert(key.into(), want.into());
+            }
+            let filter = Value::Object(filter).to_string();
+            // Near the moment; and further back, for a store sampled by
+            // the minute.
+            [SPACING_NEAR, SPACING_FAR].into_iter().find_map(|back| {
+                let mut gaps: Vec<f64> = self
+                    .samples(metric, &filter, until - back, until)
+                    .windows(2)
+                    .map(|pair| pair[1].0 - pair[0].0)
+                    .filter(|gap| *gap > 0.0)
+                    .collect();
+                gaps.sort_by(f64::total_cmp);
+                (gaps.len() >= 2).then(|| gaps[gaps.len() / 2])
+            })
+        };
+        (
+            of("sys_cpu_busy_pct", Some(("cpu", "all"))),
+            of("acct_processes", None),
+        )
+    }
+
+    fn samples(&self, metric: &str, filter: &str, from: f64, to: f64) -> Vec<(f64, f64)> {
         let read = || -> Result<Vec<(f64, f64)>> {
             let mut statement = self.metrics.prepare_cached(
                 "SELECT ts, value FROM timeless_raw(?1, ?2, ?3, ?4, ?5) ORDER BY ts",
@@ -146,7 +207,7 @@ impl Store {
                 params![
                     METRICS_TABLE,
                     metric,
-                    Value::Object(filter).to_string(),
+                    filter,
                     from.floor() as i64,
                     to.ceil() as i64
                 ],
@@ -218,7 +279,7 @@ impl Store {
         }
         (
             self.history("sys_cpu_busy_pct", "cpu", "all", from, to),
-            10.0,
+            self.spacing(to).0.unwrap_or(SPACING),
         )
     }
 
@@ -249,50 +310,123 @@ impl Store {
     }
 
     /// The processes that ended within reach and are wanted, the last to
-    /// end first.
-    ///
-    /// What is wanted is decided as the store is read, and not after: a
-    /// busy host ends hundreds of processes a minute, and the one that is
-    /// looked for is seldom among the last few.
+    /// end first: all of the reach, read a page at a time.
+    #[cfg(test)]
     pub fn exits(&self, reach: Reach, wanted: &dyn Fn(&Exit) -> bool) -> Result<Vec<Exit>> {
-        let Reach { until, span, limit } = reach;
-        let mut statement = self.logs.prepare_cached(&format!(
-            "SELECT ts, level, metadata FROM {LOGS_TABLE}
-              WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts DESC"
-        ))?;
-        let mut rows =
-            statement.query(params![((until - span) * 1e6) as i64, (until * 1e6) as i64])?;
+        let from = ((reach.until - reach.span) * 1e6) as i64;
+        let mut upto = (reach.until * 1e6).floor() as i64;
+        let mut seen = std::collections::HashSet::new();
         let mut exits = Vec::new();
-        while let Some(row) = rows.next()? {
-            if exits.len() == limit {
-                break;
-            }
-            let record: Value = serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default();
-            if record["kind"] != "exit" {
-                continue;
-            }
-            let text = |key: &str| record[key].as_str().unwrap_or("").to_string();
-            let exit = Exit {
-                at: row.get::<_, i64>(0)? as f64 / 1e6,
-                name: text("service"),
-                pid: record["pid"].as_u64().unwrap_or(0),
-                user: text("user"),
-                status: text("status"),
-                level: row.get(1)?,
-                elapsed: record["elapsed_seconds"].as_f64().unwrap_or(0.0),
-                cpu: record["cpu_seconds"].as_f64().unwrap_or(0.0),
-                peak_rss: record["peak_rss_bytes"].as_u64().unwrap_or(0),
-                unit: text("unit"),
-                command: match text("cmdline") {
-                    cmdline if cmdline.is_empty() => text("service"),
-                    cmdline => cmdline,
-                },
-            };
-            if wanted(&exit) {
-                exits.push(exit);
+        loop {
+            let page = self.exits_page(from, upto, reach.limit - exits.len(), "", wanted)?;
+            exits.extend(
+                page.found
+                    .into_iter()
+                    .filter(|exit| seen.insert(((exit.at * 1e6).round() as i64, exit.pid))),
+            );
+            match page.next {
+                Some(next) if exits.len() < reach.limit => upto = next,
+                _ => break,
             }
         }
         Ok(exits)
+    }
+
+    /// The last processes to end from `from` to `upto`, in microseconds
+    /// and with both in it: the last first, and no more than `limit`. The
+    /// store stops at that many itself, and an hour is no more work than
+    /// a minute.
+    pub fn exits_latest(&self, from: i64, upto: i64, limit: usize) -> Result<Vec<Exit>> {
+        Ok(self.exits_page(from, upto, limit, "", &|_| true)?.found)
+    }
+
+    /// A page of the records from `from` to `upto`, in microseconds and
+    /// with both in it: the last `PAGE` of them, and of those the ones
+    /// that are wanted, the last to end first and no more than `limit`.
+    ///
+    /// The store hands over every record it is asked for before the first
+    /// can be looked at, at some ten kilobytes each: an hour in which a
+    /// quarter of a million processes ended took four seconds and 2.8 GiB
+    /// to count. It does stop at a number it is given, if the stretch is
+    /// given with both its ends in it. So a stretch is read in pages, and
+    /// the next page is up to where this one ended.
+    ///
+    /// `looked_for` is what `wanted` is after, if it is a text: a record
+    /// that does not have it anywhere is not taken apart to be asked.
+    pub fn exits_page(
+        &self,
+        from: i64,
+        upto: i64,
+        limit: usize,
+        looked_for: &str,
+        wanted: &dyn Fn(&Exit) -> bool,
+    ) -> Result<Page> {
+        let needle = Needle::new(looked_for);
+        // A page of what is looked for is a page of records read; a page
+        // of all there is, is what was asked for and no more.
+        let page = if needle.is_empty() {
+            limit.min(PAGE)
+        } else {
+            PAGE
+        };
+        let mut statement = self.logs.prepare_cached(&format!(
+            "SELECT ts, level, metadata FROM {LOGS_TABLE}
+              WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT ?3"
+        ))?;
+        let mut rows = statement.query(params![from, upto, page as i64])?;
+        let (mut found, mut read, mut oldest) = (Vec::new(), 0, upto);
+        while let Some(row) = rows.next()? {
+            read += 1;
+            oldest = row.get(0)?;
+            if found.len() >= limit {
+                continue;
+            }
+            let record = row.get_ref(2)?.as_str()?;
+            if !needle.may_be_in(record) {
+                continue;
+            }
+            let Some(exit) = exit_of(oldest, row.get(1)?, record) else {
+                continue;
+            };
+            if wanted(&exit) {
+                found.push(exit);
+            }
+        }
+        // A full page may have stopped among records of one instant: the
+        // next begins at that instant again, and what it finds twice is
+        // for whoever keeps them to know. Unless all of the page was of
+        // one instant, and then it begins before it.
+        let next =
+            (read == page && page > 0).then(|| if oldest < upto { oldest } else { oldest - 1 });
+        Ok(Page {
+            found,
+            read,
+            reached: oldest,
+            next: next.filter(|next| *next >= from),
+        })
+    }
+
+    /// The processes that ended from `from` to `upto` and whose record
+    /// says `text`: the command's name is in what a record says, and how
+    /// it ended. The store looks for this itself, and an hour is no more
+    /// work than a minute.
+    pub fn exits_saying(&self, text: &str, from: i64, upto: i64, limit: usize) -> Vec<Exit> {
+        let read = || -> Result<Vec<Exit>> {
+            let mut statement = self.logs.prepare_cached(&format!(
+                "SELECT ts, level, metadata FROM {LOGS_TABLE}
+                  WHERE ts >= ?1 AND ts <= ?2 AND message_contains = ?3
+                  ORDER BY ts DESC LIMIT ?4"
+            ))?;
+            let mut rows = statement.query(params![from, upto, text, limit as i64])?;
+            let mut exits = Vec::new();
+            while let Some(row) = rows.next()? {
+                let record = row.get_ref(2)?.as_str()?;
+                exits.extend(exit_of(row.get(0)?, row.get(1)?, record));
+            }
+            Ok(exits)
+        };
+        // A store whose engine cannot look is one that is read through.
+        read().unwrap_or_default()
     }
 
     /// The record of how a process ended, if it has: the first of that
@@ -318,41 +452,66 @@ impl Store {
         None
     }
 
-    /// The jobs with a process that started within reach, and that are
-    /// wanted, the last to start first. A job is more than one process.
-    pub fn jobs(
-        &self,
-        reach: Reach,
-        width: usize,
-        wanted: &dyn Fn(&Job) -> bool,
-    ) -> Result<Vec<Job>> {
+    /// The jobs with a process that started within reach, the last to
+    /// start first. A job is more than one process.
+    ///
+    /// With something `looked_for`, the jobs that have it in them: in what
+    /// any of their processes ran, or as whom, or where. A build is found
+    /// by its compiler, and not only by what it was started with.
+    pub fn jobs(&self, reach: Reach, width: usize, looked_for: &str) -> Result<Vec<Job>> {
         let Reach { until, span, limit } = reach;
         let Some(traces) = &self.traces else {
             return Ok(Vec::new());
         };
-        // The latest to start are the ones wanted, and the store gives
-        // spans in no order that says so: the ids of all of them are read,
-        // and the jobs of the latest are read in full.
-        let mut latest: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+        let needle = Needle::new(looked_for);
+        // The store gives spans in no order that says which are the
+        // latest: all of the reach is read once, for which jobs there are,
+        // when each began, and whether it is wanted. Spans are handed over
+        // one at a time, and an hour of them is a third of a second.
+        struct Seen {
+            first: i64,
+            spans: usize,
+            wanted: bool,
+        }
+        let mut seen: BTreeMap<Vec<u8>, Seen> = BTreeMap::new();
         {
+            let columns = if needle.is_empty() {
+                "trace_id, start_ts"
+            } else {
+                "trace_id, start_ts, name, attributes"
+            };
             let mut statement = traces.prepare_cached(&format!(
-                "SELECT trace_id, start_ts FROM {TRACES_TABLE} WHERE start_ts BETWEEN ?1 AND ?2"
+                "SELECT {columns} FROM {TRACES_TABLE} WHERE start_ts BETWEEN ?1 AND ?2"
             ))?;
             let mut rows =
                 statement.query(params![((until - span) * 1e9) as i64, (until * 1e9) as i64])?;
-            let mut seen: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
             while let Some(row) = rows.next()? {
-                let trace: Vec<u8> = row.get(0)?;
                 let start: i64 = row.get(1)?;
-                *seen.entry(trace.clone()).or_default() += 1;
-                let first = latest.entry(trace).or_insert(start);
-                *first = (*first).min(start);
+                let wanted = needle.is_empty() || {
+                    let name = row.get_ref(2)?.as_str()?;
+                    let attributes = row.get_ref(3)?.as_str()?;
+                    needle.is_in(name)
+                        || (needle.may_be_in(attributes)
+                            && serde_json::from_str::<Value>(attributes)
+                                .is_ok_and(|attributes| needle.is_in(&said(name, &attributes))))
+                };
+                let job = seen.entry(row.get(0)?).or_insert(Seen {
+                    first: start,
+                    spans: 0,
+                    wanted: false,
+                });
+                job.first = job.first.min(start);
+                job.spans += 1;
+                job.wanted |= wanted;
             }
-            latest.retain(|trace, _| seen[trace] > 1);
         }
-        let mut order: Vec<(i64, Vec<u8>)> = latest
+        // One process seen is not yet not a job: the rest of it may have
+        // started before the reach. What is looked for is rare enough to
+        // read and see; what is not, is left for a reach that has it.
+        let mut order: Vec<(i64, Vec<u8>)> = seen
             .into_iter()
-            .map(|(trace, start)| (start, trace))
+            .filter(|(_, job)| job.wanted && (job.spans > 1 || !needle.is_empty()))
+            .map(|(trace, job)| (job.first, trace))
             .collect();
         order.sort_unstable_by(|a, b| b.cmp(a));
 
@@ -362,7 +521,7 @@ impl Store {
                 break;
             }
             let all = nodes(traces, &trace)?;
-            let Some(first) = all.first() else {
+            let Some(first) = all.first().filter(|_| all.len() > 1) else {
                 continue;
             };
             let start = all.iter().map(|n| n.start_ns).min().unwrap_or(0);
@@ -371,7 +530,7 @@ impl Store {
                 .map(|n| n.start_ns + n.duration_ns)
                 .max()
                 .unwrap_or(start);
-            let job = Job {
+            jobs.push(Job {
                 started: start as f64 / 1e9,
                 duration: (end - start) as f64 / 1e9,
                 cpu: all
@@ -383,13 +542,116 @@ impl Store {
                 unit: first.unit.clone(),
                 command: first.command(width),
                 tree: tree(&all, 200, width),
+                said: all
+                    .iter()
+                    .map(|n| said(&n.name, &n.attributes))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 running: false,
-            };
-            if wanted(&job) {
-                jobs.push(job);
-            }
+            });
         }
         Ok(jobs)
+    }
+}
+
+/// What can be looked for in a process of a job: what it ran, what it was
+/// started as, as whom, and where.
+pub fn said(name: &str, attributes: &Value) -> String {
+    let mut said = name.to_string();
+    for key in [
+        "process.command_line",
+        "process.started_as",
+        "process.owner",
+        "process.unit",
+    ] {
+        if let Some(text) = attributes[key].as_str().filter(|text| !text.is_empty()) {
+            said.push(' ');
+            said.push_str(text);
+        }
+    }
+    said
+}
+
+/// A process that ended, from its record.
+fn exit_of(ts: i64, level: String, record: &str) -> Option<Exit> {
+    let record: Value = serde_json::from_str(record).ok()?;
+    if record["kind"] != "exit" {
+        return None;
+    }
+    let text = |key: &str| record[key].as_str().unwrap_or("").to_string();
+    Some(Exit {
+        at: ts as f64 / 1e6,
+        name: text("service"),
+        pid: record["pid"].as_u64().unwrap_or(0),
+        user: text("user"),
+        status: text("status"),
+        level,
+        elapsed: record["elapsed_seconds"].as_f64().unwrap_or(0.0),
+        cpu: record["cpu_seconds"].as_f64().unwrap_or(0.0),
+        peak_rss: record["peak_rss_bytes"].as_u64().unwrap_or(0),
+        unit: text("unit"),
+        command: match text("cmdline") {
+            cmdline if cmdline.is_empty() => text("service"),
+            cmdline => cmdline,
+        },
+    })
+}
+
+/// Records the store is asked for at once. At the ten kilobytes it takes
+/// to hand one over, a fifth of a gigabyte while a page is read.
+const PAGE: usize = if cfg!(test) { 2_000 } else { 20_000 };
+
+/// A page of records: what it had of what was wanted, and where it ended.
+#[derive(Debug)]
+pub struct Page {
+    pub found: Vec<Exit>,
+    /// How many records it held.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub read: usize,
+    /// The time of the earliest of them, in microseconds.
+    pub reached: i64,
+    /// Up to when the next page is, if there is one.
+    pub next: Option<i64>,
+}
+
+/// A text that is looked for, in whatever case it is written.
+pub struct Needle {
+    text: String,
+    /// It can be looked for in a record as the store keeps it, before the
+    /// record is taken apart: it has nothing in it that is written
+    /// otherwise there.
+    plain: bool,
+}
+
+impl Needle {
+    pub fn new(text: &str) -> Self {
+        Self {
+            plain: text.is_ascii()
+                && !text.contains(['"', '\\'])
+                && !text.chars().any(char::is_control),
+            text: text.to_lowercase(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Whether it is in `text`.
+    pub fn is_in(&self, text: &str) -> bool {
+        self.text.is_empty() || text.to_lowercase().contains(&self.text)
+    }
+
+    /// False only if it cannot be in any field of `record`, which is JSON.
+    pub fn may_be_in(&self, record: &str) -> bool {
+        if self.text.is_empty() || !self.plain {
+            return true;
+        }
+        let (needle, hay) = (self.text.as_bytes(), record.as_bytes());
+        hay.len() >= needle.len()
+            && hay
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
     }
 }
 
@@ -441,7 +703,7 @@ mod tests {
     use super::super::data::tests::batch;
     use super::super::data::Snapshot;
     use super::*;
-    use crate::model::{Event, Level, MetricBatch, Span};
+    use crate::model::{labels, no_labels, Event, Level, MetricBatch, Span};
     use crate::sink::embedded::{EmbeddedOptions, EmbeddedSink};
     use crate::sink::{Sink, Tick};
     use crate::testutil::Fixture;
@@ -579,6 +841,105 @@ mod tests {
         assert!(Snapshot::read(0.0, &mut store.at(1_752_000_000.0, 30.0)).is_empty());
     }
 
+    /// A store of the system sampled every `system` seconds and the
+    /// processes every `processes`, for ten minutes.
+    fn paced(fixture: &Fixture, system: i64, processes: i64) -> Store {
+        let options = EmbeddedOptions {
+            dir: fixture.path("data"),
+            ..EmbeddedOptions::default()
+        };
+        let mut sink = EmbeddedSink::open(&options).unwrap();
+        for second in 0..600 {
+            let mut metrics = MetricBatch::new(1_753_000_000 + second);
+            // A collector that was stopped for a while, and a tick it
+            // missed: gaps, and not how far apart its samples are.
+            if (200..290).contains(&second) || second == 300 {
+                continue;
+            }
+            if second % system == 0 {
+                metrics.push(
+                    "sys_cpu_busy_pct",
+                    &labels(vec![("cpu", "all".into())]),
+                    5.0,
+                );
+                metrics.push("sys_cpu_busy_pct", &labels(vec![("cpu", "0".into())]), 5.0);
+            }
+            if second % processes == 0 {
+                metrics.push("acct_processes", &no_labels(), 200.0);
+                metrics.push(
+                    "unit_cpu_pct",
+                    &labels(vec![("unit", "db.service".into())]),
+                    second as f64,
+                );
+            }
+            if metrics.samples.is_empty() {
+                continue;
+            }
+            sink.write(
+                "host-a",
+                &Tick {
+                    metrics: &metrics,
+                    events: &[],
+                    spans: &[],
+                },
+            )
+            .unwrap();
+        }
+        sink.close().unwrap();
+        drop(sink);
+        Store::open(&fixture.path("data"), None).unwrap()
+    }
+
+    #[test]
+    fn a_store_says_how_far_apart_its_samples_are() {
+        let last = 1_753_000_599.0;
+        for (name, system, processes) in [
+            ("watch_store_pace_1", 1, 1),
+            ("watch_store_pace_10", 10, 10),
+            ("watch_store_pace_mixed", 5, 60),
+        ] {
+            let fixture = Fixture::new(name);
+            let store = paced(&fixture, system, processes);
+            assert_eq!(
+                store.spacing(last),
+                (Some(system as f64), Some(processes as f64)),
+                "{name}"
+            );
+            // Of one host, in a store that may hold another's.
+            let of_host = Store::open(&fixture.path("data"), Some("host-a")).unwrap();
+            assert_eq!(of_host.spacing(last).0, Some(system as f64), "{name}");
+            let of_another = Store::open(&fixture.path("data"), Some("host-b")).unwrap();
+            assert_eq!(of_another.spacing(last), (None, None), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_store_with_too_few_samples_does_not_say() {
+        let fixture = Fixture::new("watch_store_pace_few");
+        let store = store(&fixture);
+        // Three samples of the system, ten seconds apart, and none of
+        // `acct_processes`.
+        assert_eq!(store.spacing(1_753_000_020.0), (Some(10.0), None));
+        assert_eq!(store.spacing(1_752_000_000.0), (None, None));
+    }
+
+    #[test]
+    fn a_series_sampled_by_the_minute_is_there_between_its_samples() {
+        let fixture = Fixture::new("watch_store_pace_minute");
+        let store = paced(&fixture, 60, 60);
+        let at = 1_753_000_530.0;
+        let unit = |within: f64| {
+            Snapshot::read(at, &mut store.at(at, within))
+                .units
+                .first()
+                .and_then(|unit| unit.cpu)
+        };
+        // The last sample was fifty seconds before.
+        assert_eq!(unit(30.0), None);
+        let (_, processes) = store.spacing(at);
+        assert_eq!(unit(3.0 * processes.unwrap()), Some(480.0));
+    }
+
     #[test]
     fn a_series_is_read_over_a_stretch_of_time() {
         let fixture = Fixture::new("watch_store_history");
@@ -668,9 +1029,7 @@ mod tests {
     fn jobs_are_read_up_to_a_moment_the_last_first() {
         let fixture = Fixture::new("watch_store_jobs");
         let store = store(&fixture);
-        let jobs = store
-            .jobs(reach(1_753_000_020.0, 10), 72, &|_| true)
-            .unwrap();
+        let jobs = store.jobs(reach(1_753_000_020.0, 10), 72, "").unwrap();
         // The trace of one process is not a job.
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0].command, "sh -x");
@@ -692,17 +1051,182 @@ mod tests {
             ]
         );
 
-        let earlier = store
-            .jobs(reach(1_753_000_010.0, 10), 72, &|_| true)
-            .unwrap();
+        let earlier = store.jobs(reach(1_753_000_010.0, 10), 72, "").unwrap();
         assert_eq!(earlier.len(), 1);
         assert_eq!(earlier[0].command, "make -x");
 
-        let failed = store
-            .jobs(reach(1_753_000_020.0, 1), 72, &|job| job.failed > 0)
+        let latest = store.jobs(reach(1_753_000_020.0, 1), 72, "").unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].command, "sh -x");
+    }
+
+    #[test]
+    fn a_job_is_found_by_anything_that_ran_in_it() {
+        let fixture = Fixture::new("watch_store_jobs_looked_for");
+        let store = store(&fixture);
+        let found = |text: &str| -> Vec<String> {
+            store
+                .jobs(reach(1_753_000_020.0, 10), 72, text)
+                .unwrap()
+                .into_iter()
+                .map(|job| job.command)
+                .collect()
+        };
+        // By what it was started with, and by what it went on to run.
+        assert_eq!(found("make"), ["make -x"]);
+        assert_eq!(found("cc -x"), ["make -x"]);
+        assert_eq!(found("ls"), ["sh -x"]);
+        // By where, in whatever case it is written.
+        assert_eq!(found("BUILD.service"), ["sh -x", "make -x"]);
+        // Not by the name of a field every span has.
+        assert!(found("command_line").is_empty());
+        // A process by itself is found, and is not a job.
+        assert!(found("postgres").is_empty());
+        assert!(found("no such thing").is_empty());
+
+        let make = &store.jobs(reach(1_753_000_020.0, 10), 72, "cc").unwrap()[0];
+        assert!(
+            make.said.contains("make -x") && make.said.contains("cc -x"),
+            "{}",
+            make.said
+        );
+    }
+
+    #[test]
+    fn records_are_read_a_page_at_a_time() {
+        let fixture = Fixture::new("watch_store_pages");
+        let store = store(&fixture);
+        // Four exits, at 5, 15, 400, and 500 seconds.
+        let all = store.exits(reach(1_753_000_600.0, 10), &|_| true).unwrap();
+        assert_eq!(
+            all.iter().map(|exit| exit.pid).collect::<Vec<_>>(),
+            [73, 72, 71, 70]
+        );
+
+        let us = |seconds: f64| ((1_753_000_000.0 + seconds) * 1e6) as i64;
+        // Both ends of a stretch are in it.
+        let page = store
+            .exits_page(us(15.0), us(400.0), 10, "", &|_| true)
             .unwrap();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].command, "make -x");
+        assert_eq!(
+            page.found.iter().map(|e| e.pid).collect::<Vec<_>>(),
+            [72, 71]
+        );
+        assert_eq!((page.read, page.reached, page.next), (2, us(15.0), None));
+
+        // What is looked for narrows what is taken apart, and not what is
+        // counted as read.
+        let page = store
+            .exits_page(us(0.0), us(600.0), 10, "SLEEP", &|exit| {
+                exit.command.contains("sleep")
+            })
+            .unwrap();
+        assert_eq!(page.found.iter().map(|e| e.pid).collect::<Vec<_>>(), [72]);
+        assert_eq!(page.read, 4);
+
+        // Of all there is, no more is read than was asked for; and there
+        // is a next page, up to where this one ended.
+        let page = store
+            .exits_page(us(0.0), us(600.0), 2, "", &|_| true)
+            .unwrap();
+        assert_eq!(
+            page.found.iter().map(|e| e.pid).collect::<Vec<_>>(),
+            [73, 72]
+        );
+        assert_eq!((page.read, page.next), (2, Some(us(400.0))));
+        let latest = store.exits_latest(us(0.0), us(400.0), 3).unwrap();
+        assert_eq!(
+            latest.iter().map(|e| e.pid).collect::<Vec<_>>(),
+            [72, 71, 70]
+        );
+    }
+
+    #[test]
+    fn the_store_looks_for_what_a_record_says() {
+        let fixture = Fixture::new("watch_store_saying");
+        let store = store(&fixture);
+        let us = |seconds: f64| ((1_753_000_000.0 + seconds) * 1e6) as i64;
+        let said = |text: &str| -> Vec<u64> {
+            store
+                .exits_saying(text, us(0.0), us(600.0), 10)
+                .iter()
+                .map(|exit| exit.pid)
+                .collect()
+        };
+        // How it ended is in what the record says.
+        assert_eq!(said("SIGKILL"), [72]);
+        assert_eq!(said("sigsegv"), [73]);
+        assert!(said("no such thing").is_empty());
+    }
+
+    #[test]
+    fn a_stretch_that_holds_more_than_a_page_is_read_in_pages_and_each_record_once() {
+        let fixture = Fixture::new("watch_store_many");
+        let options = EmbeddedOptions {
+            dir: fixture.path("data"),
+            ..EmbeddedOptions::default()
+        };
+        let mut sink = EmbeddedSink::open(&options).unwrap();
+        // A fork storm: more than two pages of processes ending in a
+        // minute, a hundred of them at each instant.
+        let count = 2 * PAGE as u64 + 5_000;
+        let events: Vec<Event> = (0..count)
+            .map(|n| exit(1_753_000_000.0 + (n / 100) as f64 * 0.1, n, "0", "true"))
+            .collect();
+        sink.write(
+            "host-a",
+            &Tick {
+                metrics: &MetricBatch::new(0),
+                events: &events,
+                spans: &[],
+            },
+        )
+        .unwrap();
+        sink.close().unwrap();
+        drop(sink);
+        let store = Store::open(&fixture.path("data"), None).unwrap();
+
+        let us = |seconds: f64| ((1_753_000_000.0 + seconds) * 1e6) as i64;
+        // A page is what is read at once, and says where the next is.
+        let first = store
+            .exits_page(us(0.0), us(60.0), 10, "true", &|_| true)
+            .unwrap();
+        assert_eq!((first.found.len(), first.read), (10, PAGE));
+        assert!(first
+            .next
+            .is_some_and(|next| next < us(60.0) && next >= first.reached));
+
+        // Read through, every one is found once, the last first.
+        let all = store
+            .exits(
+                Reach {
+                    until: 1_753_000_060.0,
+                    span: 3600.0,
+                    limit: count as usize + 1,
+                },
+                &|_| true,
+            )
+            .unwrap();
+        assert_eq!(all.len(), count as usize);
+        assert!(all.windows(2).all(|pair| pair[0].at >= pair[1].at));
+        let mut pids: Vec<u64> = all.iter().map(|exit| exit.pid).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        assert_eq!(pids.len(), count as usize);
+    }
+
+    #[test]
+    fn what_is_looked_for_is_found_in_any_case_and_not_in_what_cannot_have_it() {
+        let needle = Needle::new("RustC");
+        assert!(needle.is_in("/usr/bin/rustc --edition"));
+        assert!(needle.may_be_in(r#"{"cmdline":"RUSTC -O"}"#));
+        assert!(!needle.may_be_in(r#"{"cmdline":"cc -O"}"#));
+        assert!(!needle.may_be_in("ru"));
+        // What a record writes otherwise is not judged before it is read.
+        assert!(Needle::new(r#"say "hi""#).may_be_in(r#"{"cmdline":"cc"}"#));
+        assert!(Needle::new("naïve").may_be_in(r#"{"cmdline":"cc"}"#));
+        assert!(!Needle::new("naïve").is_in("cc"));
+        assert!(Needle::new("").is_in("anything") && Needle::new("").may_be_in("{}"));
     }
 
     #[test]

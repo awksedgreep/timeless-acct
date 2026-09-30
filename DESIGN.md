@@ -676,6 +676,60 @@ on until there are enough or the stretch is at an end. And when something
 is looked for, the stretch is as long as the timeline's, and not the
 quarter of an hour that is enough for looking at what just happened.
 
+### And read a page at a time
+
+That was written on a quiet host. Over an hour in which a quarter of a
+million processes ended, looking for `rustc` stopped the screen for four
+seconds among the exits and twenty-five among the jobs, and left the
+viewer at 2.85 GB.
+
+The logs engine hands over every record it is asked for before the first
+can be looked at, at about ten kilobytes each: to count that hour took
+the same four seconds and the same memory as to read it
+([timeless-libsql#77](https://github.com/awksedgreep/timeless-libsql/issues/77)).
+Three things it does do are what the viewer now asks for.
+
+It stops at a number it is given, if the stretch is given with both its
+ends in it; with `ts < ?` for an end it reads everything
+([#89](https://github.com/awksedgreep/timeless-libsql/issues/89)). So the exits
+with nothing looked for are one question, of the last two hundred, and
+an hour costs what a minute does.
+
+It looks for a text in what a record says, itself, before handing
+anything over. A record says the command's name and how it ended, so
+those are found over the whole stretch at once: `rustc` in 50 ms.
+
+And what a record does not say (what it ran in full, its unit, its user)
+is read for in pages of 20,000 records, the latest first, each page up to
+where the one before ended. A page is a fifth of a gigabyte while it is
+read and is given back after. The reading is done between the keys: the
+screen shows what has been found and how far back the reading has got,
+and a key is answered at once. It ends when a screen's worth is found
+with nothing later unread, which for anything that happens often is the
+first page.
+
+Slices of time were tried first, and were the wrong unit twice. How many
+records a minute holds is not known until it is read, and a slice of a
+quiet hour that ran into a build was a gigabyte. And the engine reads
+whole blocks, some of which span half an hour: a one-second slice under
+such a block cost what a minute did, and the hour took a hundred seconds.
+
+The spans engine hands rows over one at a time, and an hour of them is a
+third of a second. So the jobs are read in one pass: which there are,
+when each began, and whether anything that ran in it is what is looked
+for. What took twenty-five seconds was asking for each job in turn to see
+whether its first command matched, which also meant a build was not found
+by its compiler.
+
+| over that hour | before | now |
+|---|---|---|
+| the exits, nothing looked for | 473 MB | 0.2 s, 257 MB while read |
+| `rustc`, among the exits | 4.1 s | 0.5 s |
+| a unit's name, among the exits | 4 s | 0.9 s |
+| a text that is not there | 4 s, the screen stopped | 7 s, the screen answering |
+| `rustc`, among the jobs | 25.3 s, and none found | 1.8 s, the builds |
+| the viewer afterwards | 2,849 MB | about 160 MB |
+
 ### Jobs that have not ended
 
 A span is written when its process ends, so the store knows a job when it
@@ -697,10 +751,26 @@ select many processes by one label, which is all a canvas element has.
 
 ### What is asked of the store
 
-A moment is the last sample of each series in the thirty seconds before
-it. A process that had ended by then has no sample in those thirty
-seconds, and is not on the screen: no list of what was alive is kept,
-because the samples are one.
+A moment is the last sample of each series in the three samples before
+it. A process that had ended by then has no sample in those, and is not
+on the screen: no list of what was alive is kept, because the samples
+are one.
+
+How far apart samples are is what the collector was told when it was
+started, and a store does not say what it was told. The viewer measures
+it, from the samples before the moment looked at: the gap that half of
+them are no further apart than, so that a collector that was stopped for
+an hour is a gap and not the spacing. A step in time is one sample of
+whichever is sampled more often, the system or the processes, and what
+is there at a moment is looked for over three of whichever is sampled
+less.
+
+It was thirty seconds and a step of ten, which are those of the default.
+A store sampled every forty seconds had nothing on the screen at most
+moments, and one sampled every second was stepped through ten at a time.
+On the same host over the same four minutes, the browser's highest CPU
+was 134% in the store sampled every second and 32% in the one sampled
+every forty.
 
 Holding an arrow down goes through time without reading each moment passed
 on the way. Every key that is waiting is taken before anything is read.

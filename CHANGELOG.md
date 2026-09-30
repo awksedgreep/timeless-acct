@@ -1,5 +1,22 @@
 # Changes
 
+## Not yet in a version
+
+- The viewer keeps the pace of the store. It took samples to be ten
+  seconds apart: a store sampled less often than every thirty seconds
+  had an empty screen at most moments in the past, and one sampled every
+  second was stepped through ten samples at a time.
+
+- Looking for something in the viewer no longer stops the screen or
+  takes gigabytes. Over an hour in which a quarter of a million processes
+  ended, `/rustc` took 4 seconds among the exits and 25 among the jobs,
+  and left the viewer at 2.85 GB; it takes half a second and under two,
+  and the viewer is at 160 MB after. (#4, #5)
+- A job is found by anything that ran in it, and not only by what it was
+  started with. (#7)
+- `esc` goes back from what is looked for before it leaves the viewer.
+  (#6)
+
 ## 0.2.1
 
 - After a burst of processes the collector comes back to near the size

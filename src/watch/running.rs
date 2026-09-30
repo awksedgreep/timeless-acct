@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::collect::process::Tracked;
 use crate::query::{tree, Node};
 
-use super::store::Job;
+use super::store::{said, Job};
 
 /// The jobs among the processes that are running.
 ///
@@ -83,6 +83,19 @@ pub fn running<'a>(
             unit: members[0].unit.clone(),
             command: nodes[0].command(width),
             tree: tree(&nodes, 200, width),
+            said: members
+                .iter()
+                .zip(&nodes)
+                .map(|(process, node)| {
+                    format!(
+                        "{} {} {}",
+                        said(&node.name, &node.attributes),
+                        process.user,
+                        process.unit
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
             running: true,
         });
     }

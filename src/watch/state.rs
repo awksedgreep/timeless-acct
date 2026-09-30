@@ -276,7 +276,12 @@ impl State {
         let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
         let (minute, hour) = (60.0, 3600.0);
         match key.code {
-            // Out of a unit before out of the program.
+            // Back from what was done last: from what is looked for, then
+            // out of a unit, and only then out of the program.
+            KeyCode::Esc if !self.filter.is_empty() => {
+                self.filter.clear();
+                return Changed::Moment;
+            }
             KeyCode::Esc | KeyCode::Backspace if self.within.is_some() => {
                 self.within = None;
                 self.tab = Tab::Units;
@@ -606,6 +611,28 @@ mod tests {
         state.key(key(KeyCode::Esc), NOW, RANGE);
         assert_eq!(state.filter, "");
         assert_eq!(state.processes(&snapshot).len(), 2);
+    }
+
+    #[test]
+    fn escape_goes_back_from_what_is_looked_for_before_it_goes_out() {
+        let mut state = State::new(None, 10.0);
+        state.enter("db.service".into());
+        press(&mut state, "/");
+        press(&mut state, "post");
+        state.key(key(KeyCode::Enter), NOW, RANGE);
+        assert_eq!(state.filter, "post");
+        assert!(!state.typing);
+
+        // The filter, then the unit, then the program.
+        assert_eq!(state.key(key(KeyCode::Esc), NOW, RANGE), Changed::Moment);
+        assert_eq!(state.filter, "");
+        assert!(state.within.is_some());
+        assert!(!state.quit);
+        state.key(key(KeyCode::Esc), NOW, RANGE);
+        assert!(state.within.is_none());
+        assert!(!state.quit);
+        state.key(key(KeyCode::Esc), NOW, RANGE);
+        assert!(state.quit);
     }
 
     #[test]
