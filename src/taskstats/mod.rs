@@ -20,7 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::netlink::Received;
-use crate::queue::{queue, Receiver};
+use crate::queue::{queue, settle, Receiver};
 use netlink::{exit_records, Socket};
 use record::{TaskExit, AFORK};
 
@@ -304,6 +304,7 @@ impl Aggregator {
     pub fn prune(&mut self, now: f64, max_idle: f64, alive: impl Fn(u32) -> bool) {
         self.partial
             .retain(|pid, partial| now - partial.updated < max_idle || alive(*pid));
+        settle(&mut self.partial);
     }
 
     #[cfg(test)]

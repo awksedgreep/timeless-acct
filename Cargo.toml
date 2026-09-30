@@ -1,6 +1,6 @@
 [package]
 name = "timeless-acct"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "Linux system and process accounting history in timeless-libsql: sar-style system stats, per-process series, and an exit record for every process — with rewind."

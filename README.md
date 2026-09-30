@@ -84,7 +84,7 @@ $ timeless-acct trees --comm cc1
 
 ## Status
 
-Version 0.2.0. Collection, both sinks, the viewer, and the three query
+Version 0.2.1. Collection, both sinks, the viewer, and the three query
 commands work and
 are tested against a live kernel, on a host run by systemd with the unified
 control group hierarchy. [What is not here yet](#what-is-not-here-yet)

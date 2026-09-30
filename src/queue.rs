@@ -4,7 +4,12 @@
 //! storm when one comes. It takes memory as it fills and no sooner, and
 //! holds no more than its limit: what arrives at a full queue is refused,
 //! for the listener to count as lost.
+//!
+//! What is taken from it is kept in maps for a sweep or two, and those
+//! give back the room they were given: see `settle`.
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -66,9 +71,45 @@ impl<T> Receiver<T> {
     }
 }
 
+/// Let go of the room a map was given for a burst that is over.
+///
+/// A map grows to hold what is put in it and keeps that size when it is
+/// emptied. After 120,000 processes had started and ended in six seconds,
+/// two maps of what was known of them held 48 MB between them, and a
+/// few hundred entries.
+pub fn settle<K: Eq + Hash, V>(map: &mut HashMap<K, V>) {
+    if map.capacity() > ROOM_KEPT && map.capacity() / 4 > map.len() {
+        map.shrink_to(2 * map.len().max(ROOM_KEPT / 2));
+    }
+}
+
+/// Places a map may keep whatever it holds: what a busy host fills.
+const ROOM_KEPT: usize = 4096;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_map_gives_back_the_room_of_a_burst_and_keeps_what_it_holds() {
+        let mut map: HashMap<u32, [u8; 64]> = (0..100_000).map(|n| (n, [0; 64])).collect();
+        map.retain(|n, _| *n < 300);
+        // Emptied, it has the room it had: less what the places of the
+        // removed take until the map is next rebuilt.
+        let grown = map.capacity();
+        assert!(grown > 50_000, "{grown}");
+
+        settle(&mut map);
+        assert!(map.capacity() < grown / 8, "{}", map.capacity());
+        assert!(map.capacity() >= ROOM_KEPT);
+        assert_eq!(map.len(), 300);
+        assert!((0..300).all(|n| map.contains_key(&n)));
+
+        // And is left alone where there was no burst.
+        let settled = map.capacity();
+        settle(&mut map);
+        assert_eq!(map.capacity(), settled);
+    }
 
     #[test]
     fn a_full_queue_refuses_and_an_emptied_one_takes_again() {

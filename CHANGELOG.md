@@ -1,5 +1,11 @@
 # Changes
 
+## 0.2.1
+
+- After a burst of processes the collector comes back to near the size
+  it was. It had stayed at more than twice that: its maps and SQLite's
+  page cache kept the room the burst had needed.
+
 ## 0.2.0
 
 What is stored has changed shape in two places. A store written by 0.1.0

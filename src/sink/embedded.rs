@@ -297,7 +297,12 @@ impl Sink for EmbeddedSink {
         Self::command(&self.logs, LOGS_TABLE, "flush")?;
         Self::command(&self.traces, TRACES_TABLE, "flush")?;
         // What was waiting to be written is written. A build that ends
-        // five thousand processes in a minute leaves that much behind.
+        // five thousand processes in a minute leaves that much behind:
+        // in the pages SQLite keeps of what it wrote, which it holds on
+        // to until it is asked, and in the allocator.
+        for connection in [&self.metrics, &self.logs, &self.traces] {
+            connection.execute_batch("PRAGMA shrink_memory;")?;
+        }
         release_freed_memory();
         Ok(())
     }

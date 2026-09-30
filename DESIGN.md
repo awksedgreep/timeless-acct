@@ -239,6 +239,16 @@ The two were run side by side through 120,000 processes started and
 ended in six seconds. The queue of 16,384 lost 103,794 exit records and
 92,693 execs. The one that grows lost none.
 
+What is taken from the queue is kept for a sweep or two, in maps of
+what is known of each process, and a map keeps the size it grew to when
+it is emptied. So does the cache of pages SQLite has written. An hour
+after that test, and after a compaction, the collector was at 290 MB
+where it had been at 125: 48 MB was two maps with a few hundred entries
+in them, and 22 MB was pages. The maps now give back the room of a burst
+when it is over, and SQLite is asked for its pages at every flush. The
+same test then left the collector 40 MB above where it began, two minutes
+after.
+
 Keeping them has a price, which is paid once they are taken. A tick's
 records are made into log entries and spans together and written
 together, at about 9 KB each while that is done: the collector was at

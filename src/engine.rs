@@ -19,6 +19,7 @@ use crate::model::{no_labels, Event, MetricBatch, Span};
 use crate::procevents::{Exec, ExecListener};
 use crate::procfs::process::{group_name, is_launcher, parse_pid_stat};
 use crate::procfs::ProcRoot;
+use crate::queue::settle;
 use crate::sink::{Sink, Tick};
 use crate::taskstats::{epoch_now, Aggregator, Listener, ProcessExit};
 
@@ -685,6 +686,7 @@ impl Engine {
                     .as_ref()
                     .is_some_and(|c| c.find(*pid, exec.start_epoch, START_TOLERANCE).is_some())
         });
+        settle(&mut self.described);
 
         // The ended are kept for the children that end after them, which
         // is as long as a process can go unseen: until the next sweep.

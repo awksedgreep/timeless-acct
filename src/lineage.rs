@@ -21,6 +21,8 @@
 
 use std::collections::HashMap;
 
+use crate::queue::settle;
+
 /// How far apart two readings of a process's start may be for them to be
 /// the same process. One is counted from boot in ticks; the other is the
 /// kernel's, in whole seconds, from a different clock.
@@ -274,6 +276,8 @@ impl Lineage {
         let max_age = self.max_age;
         self.groups
             .retain(|_, origin| now - origin.used <= max_age + grace);
+        settle(&mut self.known);
+        settle(&mut self.groups);
     }
 
     #[cfg(test)]
