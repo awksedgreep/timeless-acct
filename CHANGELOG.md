@@ -17,6 +17,14 @@
 - `esc` goes back from what is looked for before it leaves the viewer.
   (#6)
 
+- The local store keeps less, and the same as a node: samples for 7 days
+  (was 30), rolled up to five minutes for 30 days and to an hour for 180
+  (was 180 days and forever), records for 30 days (was 90), spans for 30.
+  A week of samples is enough to fight a fire with, six months has its
+  value at the hour, and nothing is kept forever, because a forever tier
+  holds every process that ever lived. They apply to a store when it is
+  created; an existing store keeps what it was made with. (#10)
+
 ## 0.2.1
 
 - After a burst of processes the collector comes back to near the size

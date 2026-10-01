@@ -124,7 +124,9 @@ logs plane                   http://127.0.0.1:9428  answering, version 0.8.5
 
 ### To the canvas
 
-The canvas reads from the Timeless planes. Point the collector at them:
+The canvas reads from the Timeless planes. Point the collector at them,
+on the same network: this sends every sample as text, about 100 bytes
+each, and is not the path for a remote collector on a thin link.
 
 ```sh
 timeless-acct run --sink http
@@ -697,24 +699,30 @@ How much smaller stored than written:
 | an accounting record | 760 to 1,050 bytes | 33 to 39 bytes | 20 to 30 times |
 | a span | 820 bytes | 51 bytes | 16 times |
 
-And what that is on the workstation above, at the defaults. These are
-worked out from hours of data, not measured over months, and a server
-that ends fewer processes will be well under them.
+And what that is on the workstation above, at the defaults, from the
+first 26 hours: one working day, with a large build in it, and a night.
+A server that ends fewer processes will be well under it.
 
 | | a day | kept for | levels off at |
 |---|---:|---:|---:|
-| samples, every ten seconds | 45 to 145 MB | 30 days | 1.4 to 4.3 GB |
-| samples, rolled up to five minutes | about 18 MB | 180 days | about 3.3 GB |
-| samples, rolled up to an hour | about 15 MB | forever | it does not |
-| accounting records | 36 to 90 MB | 90 days | 3.2 to 8 GB |
-| spans | 51 to 128 MB | 30 days | 1.5 to 3.8 GB |
-| **all of it** | **170 to 400 MB** | | **9 to 19 GB after 180 days, then 20 to 30 MB a day** |
+| samples, every ten seconds | about 60 MB | 7 days | about 0.4 GB |
+| samples, rolled up to five minutes | about 40 MB | 30 days | about 1.2 GB |
+| samples, rolled up to an hour | about 23 MB | 180 days | about 4 GB |
+| the series catalog | 5 to 15 MB | with the last rollup | 1 to 2.6 GB |
+| accounting records | 34 to 63 MB | 30 days | 1 to 1.9 GB |
+| spans | 49 to 92 MB | 30 days | 1.5 to 2.8 GB |
+| **all of it** | **about 200 to 300 MB** | | **about 9 to 12 GB, at 180 days** |
 
-For a sense of scale: a week of every process on a busy workstation,
-sampled every ten seconds, is 1.2 to 2.8 GB, and its samples alone 0.3 to
-1 GB. The rollups cost more than they should, at one small chunk per
-series per hour; that is
-[timeless-libsql#81](https://github.com/awksedgreep/timeless-libsql/issues/81).
+The rollups cost more than the samples they are made of, at one small
+chunk per series per hour, and the catalog was never emptied. Both are
+fixed in the engine and not yet released
+([timeless-libsql#81](https://github.com/awksedgreep/timeless-libsql/issues/81),
+[#82](https://github.com/awksedgreep/timeless-libsql/issues/82)): with
+them the rollup rows are about half, and a series goes with its last
+rollup instead of staying. Until then the catalog row keeps growing.
+
+For a sense of scale: a week of every process on a busy workstation is
+about 2 GB, and its samples alone 0.4.
 
 ### What the store costs in memory
 
@@ -731,11 +739,13 @@ index of that store, and grows with it.
 A process that lives for thirty seconds is fifteen series, so the number
 of series is the number of processes there have been, and not the number
 there are. The workstation above made between 1,000 and 4,000 series an
-hour. At 1.9 KB each that is 50 to 180 MB a day, and it does not level
-off at thirty days with the samples: retention removes a series' data and
-leaves the series. That figure is worked out from an hour and a half, not
-measured over a month. It is the engine's to change:
-[timeless-libsql#82](https://github.com/awksedgreep/timeless-libsql/issues/82).
+hour. At 1.9 KB each that is 50 to 180 MB a day. With the engine as
+released it does not level off: retention removes a series' data and
+leaves the series. With
+[timeless-libsql#82](https://github.com/awksedgreep/timeless-libsql/issues/82)
+a series goes with its last rollup chunk, which at the defaults is after
+180 days: 3 to 10 GB of memory at the most, on this workstation, and a
+tenth of that on a server that ends few processes.
 
 Half the series of that store never held a value but zero: a process that
 never swapped, never faulted a page in from disk, never read or wrote.
@@ -789,17 +799,30 @@ minutes.
 | `--no-exec-events` | | do not ask the kernel for word of each exec |
 | `--no-traces` | | do not keep a span for each process that ends |
 | `--trace-max-age` | `1h` | how long after a job starts a process may start and be part of its trace |
-| `--retention` | `30d` | local store: how long samples are kept |
-| `--rollups` | `5m@180d,1h@0` | local store: coarser copies kept after that |
-| `--log-retention` | `90d` | local store: how long accounting records are kept |
+| `--retention` | `7d` | local store: how long samples are kept |
+| `--rollups` | `5m@30d,1h@180d` | local store: coarser copies kept after that |
+| `--log-retention` | `30d` | local store: how long accounting records are kept |
 | `--trace-retention` | `30d` | local store: how long spans are kept |
 | `--token` | | planes: a bearer token, if they require one |
 
 Sampling faster or slower, and what it costs, is under [How
 often](#how-often).
 
-Retention and rollups apply when a store is created. For the planes, they
-are the planes' own settings.
+Retention and rollups apply when a store is created; a store made with
+other settings keeps them, and there is no message. Making the flags the
+store's settings on every start needs the engine to take a new window
+for samples and spans as it does for records
+([timeless-libsql#91](https://github.com/awksedgreep/timeless-libsql/issues/91)).
+For the planes, the windows are the planes' own settings, and the same
+ones.
+
+Why these: a week of samples is enough to fight a fire with, and samples
+are most of the bytes. Six months has its value at one resolution, the
+hour: was the box this busy in March, when did this service's memory
+start climbing. Anything finer for that long is bytes for questions
+nobody asks. Nothing is kept forever, because a forever tier holds every
+process that ever lived. Records are what `exits` searches back through
+at about 40 bytes each; a quiet server can afford `--log-retention 90d`.
 
 If a plane is unreachable, the collector keeps up to an hour of ticks and
 sends them, in order and at the times they were taken, when it answers.

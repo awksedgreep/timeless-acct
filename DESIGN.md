@@ -507,6 +507,35 @@ directions were verified.
 The virtual tables are passive, so the collector does for its store what
 the servers do for theirs: it flushes every minute and compacts every hour.
 
+### And keeps what they keep, for as long
+
+Samples for a week, rolled up to five minutes for a month and to an hour
+for six, records and spans for a month. The first version kept samples
+for a month, five-minute rollups for six, and hourly rollups forever,
+which a day of measurement priced at 20 GB after six months and 10 GB a
+year after that, without end.
+
+A week of samples is enough to fight a fire with, and samples are most
+of the bytes: per-process series at ten seconds, which nobody looks at
+three weeks later. Six months has its value at one resolution, the hour,
+for the host and its units: was the box this busy in March, when did
+this service's memory start climbing, what changed since the release.
+Anything finer for that long is bytes for questions nobody asks.
+
+Nothing is kept forever, because a tier is kept for every series alike,
+and most series are processes: a forever tier holds every process that
+ever lived. Retention is per store and not per metric, so there is no
+"hourly forever for the host, hourly for a week for processes" until the
+engine has it.
+
+Records are the one thing worth keeping longer than samples, at about 40
+bytes each: they are what `exits` searches back through. A quiet server
+can keep them for ninety days; a workstation ending a million processes
+a day writes 50 MB of them a day.
+
+The planes keep the same, so a host with a store of its own and a node
+that pushes to the stack answer the same question with the same memory.
+
 ### Why every hour
 
 The servers compact every five minutes, and the collector's first version

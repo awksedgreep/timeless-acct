@@ -41,9 +41,9 @@ const LEASE_SUFFIX: &str = ".timeless-api.lock";
 #[derive(Debug, Clone)]
 pub struct EmbeddedOptions {
     pub dir: PathBuf,
-    /// How long raw samples are kept, as the engine spells it: `30d`.
+    /// How long raw samples are kept, as the engine spells it: `7d`.
     pub retention: String,
-    /// The rollup ladder: `5m@180d,1h@0`. Empty for none.
+    /// The rollup ladder: `5m@30d,1h@180d`. Empty for none.
     pub rollups: String,
     /// How long accounting records are kept.
     pub log_retention: String,
@@ -55,9 +55,9 @@ impl Default for EmbeddedOptions {
     fn default() -> Self {
         Self {
             dir: PathBuf::from("timeless-acct-data"),
-            retention: "30d".into(),
-            rollups: "5m@180d,1h@0".into(),
-            log_retention: "90d".into(),
+            retention: "7d".into(),
+            rollups: "5m@30d,1h@180d".into(),
+            log_retention: "30d".into(),
             trace_retention: "30d".into(),
         }
     }
@@ -640,8 +640,8 @@ mod tests {
             "retention='30d'"
         );
         assert_eq!(
-            table_argument("rollups", "5m@180d,1h@0").unwrap(),
-            "rollups='5m@180d,1h@0'"
+            table_argument("rollups", "5m@30d,1h@180d").unwrap(),
+            "rollups='5m@30d,1h@180d'"
         );
         assert!(table_argument("retention", "30d'); DROP TABLE logs; --").is_err());
         assert!(table_argument("retention", "").is_err());

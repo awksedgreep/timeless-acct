@@ -155,19 +155,19 @@ pub struct RunArgs {
 
     /// Local store: how long samples are kept. Applies when the store is created
     #[cfg(feature = "embedded")]
-    #[arg(long, default_value = "30d", value_name = "SPAN")]
+    #[arg(long, default_value = "7d", value_name = "SPAN")]
     pub retention: String,
 
     /// Local store: coarser copies kept after samples age out, as
     /// RESOLUTION@RETENTION. Applies when the store is created
     #[cfg(feature = "embedded")]
-    #[arg(long, default_value = "5m@180d,1h@0", value_name = "LADDER")]
+    #[arg(long, default_value = "5m@30d,1h@180d", value_name = "LADDER")]
     pub rollups: String,
 
     /// Local store: how long accounting records are kept. Applies when the
     /// store is created
     #[cfg(feature = "embedded")]
-    #[arg(long, default_value = "90d", value_name = "SPAN")]
+    #[arg(long, default_value = "30d", value_name = "SPAN")]
     pub log_retention: String,
 
     /// Local store: how long spans are kept. Applies when the store is
