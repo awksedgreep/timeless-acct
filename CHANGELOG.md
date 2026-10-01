@@ -38,6 +38,9 @@
   (timeless-libsql `5bca399`). With the defaults, a series now goes with
   its hourly rollup after 180 days instead of staying forever.
 
+- The viewer's day-long timeline tells both ends with their day. It
+  read `21:12` at both, since the day was added only past a day. (#12)
+
 ## 0.2.1
 
 - After a burst of processes the collector comes back to near the size

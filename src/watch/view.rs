@@ -134,11 +134,11 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &State, snapshot: &Snapshot
         ]),
     };
     let (from, to) = detail.window;
-    // A stretch within a day is told by the time; a longer one needs the
-    // day as well.
+    // A stretch within a day is told by the time; one of a day or longer
+    // needs the day as well, or both ends of a day read the same.
     let tell = |at: f64| -> String {
         let text = clock::format(at);
-        if to - from > 86_400.0 {
+        if to - from >= 86_400.0 {
             text[5..16].to_string()
         } else {
             text[11..16].to_string()
@@ -1245,6 +1245,18 @@ mod tests {
         assert!(lines[3].contains('▁') || lines[3].contains('▂'), "{text}");
         assert!(lines[5].contains(" cpu over 1h00m, up to 49.0% "), "{text}");
         assert!(text.contains("56°C 20W"), "{text}");
+
+        // A stretch of a day has the same time of day at both ends, so
+        // both are told with their day.
+        detail.window = (1_753_000_000.0 - 86_400.0, 1_753_000_000.0);
+        let text = screen(&mut state, &snapshot(), &detail);
+        let frame = text.lines().nth(5).unwrap();
+        let (left, right) = (
+            clock::format(1_753_000_000.0 - 86_400.0)[5..16].to_string(),
+            clock::format(1_753_000_000.0)[5..16].to_string(),
+        );
+        assert!(frame.contains(&left) && frame.contains(&right), "{frame}");
+        assert!(frame.contains("cpu over 1d00h"), "{frame}");
     }
 
     #[test]
