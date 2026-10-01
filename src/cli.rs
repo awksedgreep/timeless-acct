@@ -21,7 +21,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Collect until stopped
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Take two readings and print what would be stored
     Once(OnceArgs),
     /// Report what this host, and this user, let the collector see
@@ -175,6 +175,12 @@ pub struct RunArgs {
     #[cfg(feature = "embedded")]
     #[arg(long, default_value = "30d", value_name = "SPAN")]
     pub trace_retention: String,
+
+    /// Local store: what it may hold on disk, as 2G or 500M. Over it, the
+    /// oldest samples go first, then spans, then records; 0 for no limit
+    #[cfg(feature = "embedded")]
+    #[arg(long, default_value = "2G", value_name = "SIZE")]
+    pub store_limit: String,
 
     /// Seconds between flushes. What is written since the last one is lost
     /// if the collector is killed
@@ -500,4 +506,50 @@ pub enum SummaryBy {
     /// The unit it ran in
     Unit,
     User,
+}
+
+/// A size on disk, as it is written on the command line: `2G`, `500M`,
+/// `1.5G`, in binary units; `0`, `none`, or `off` for none at all.
+pub fn parse_size(text: &str) -> anyhow::Result<Option<u64>> {
+    let text = text.trim();
+    if matches!(text, "0" | "none" | "off") {
+        return Ok(None);
+    }
+    let (number, unit) = match text.char_indices().last() {
+        Some((index, unit)) if unit.is_ascii_alphabetic() => (&text[..index], unit),
+        _ => (text, 'B'),
+    };
+    let scale: f64 = match unit.to_ascii_uppercase() {
+        'B' => 1.0,
+        'K' => 1024.0,
+        'M' => 1024.0 * 1024.0,
+        'G' => 1024.0 * 1024.0 * 1024.0,
+        'T' => 1024.0f64.powi(4),
+        _ => anyhow::bail!("{text:?} is not a size: expected 2G, 500M, or 0 for no limit"),
+    };
+    let number: f64 = number.trim().parse().map_err(|_| {
+        anyhow::anyhow!("{text:?} is not a size: expected 2G, 500M, or 0 for no limit")
+    })?;
+    if number.is_nan() || number <= 0.0 {
+        anyhow::bail!("{text:?} is not a size: expected 2G, 500M, or 0 for no limit");
+    }
+    Ok(Some((number * scale) as u64))
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::parse_size;
+
+    #[test]
+    fn a_size_is_read_in_binary_units_or_is_no_limit() {
+        assert_eq!(parse_size("2G").unwrap(), Some(2 << 30));
+        assert_eq!(parse_size("500m").unwrap(), Some(500 << 20));
+        assert_eq!(parse_size("1.5G").unwrap(), Some(3 << 29));
+        assert_eq!(parse_size("4096").unwrap(), Some(4096));
+        assert_eq!(parse_size("0").unwrap(), None);
+        assert_eq!(parse_size("none").unwrap(), None);
+        for bad in ["", "G", "-1G", "2X", "two"] {
+            assert!(parse_size(bad).is_err(), "{bad:?}");
+        }
+    }
 }

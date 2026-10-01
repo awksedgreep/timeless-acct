@@ -53,7 +53,7 @@ use taskstats::{epoch_now, Listener};
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Run(args) => run(args),
+        Command::Run(args) => run(*args),
         Command::Once(args) => once(args),
         Command::Check(args) => {
             check::run(&args);
@@ -161,6 +161,7 @@ fn open_sink(args: &RunArgs) -> Result<Box<dyn Sink>> {
                 rollups: args.rollups.clone(),
                 log_retention: args.log_retention.clone(),
                 trace_retention: args.trace_retention.clone(),
+                limit: cli::parse_size(&args.store_limit).context("--store-limit")?,
             },
         )?),
         #[cfg(feature = "http")]

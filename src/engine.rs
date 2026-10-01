@@ -351,6 +351,20 @@ impl Engine {
                 batch.push("acct_execs_missed", &none, listener.missed() as f64);
                 batch.push("acct_execs_lost", &none, listener.lost() as f64);
             }
+            // How often this collector was told to look, so that a reader
+            // elsewhere can choose its lookback from the store.
+            if let Some(every) = self.parts.schedule.system {
+                batch.push("acct_interval_seconds", &none, every.as_secs_f64());
+            }
+            if let Some(every) = self.parts.schedule.processes {
+                batch.push("acct_process_interval_seconds", &none, every.as_secs_f64());
+            }
+            if let Some(footprint) = self.parts.sink.footprint() {
+                batch.push("acct_store_bytes", &none, footprint.bytes as f64);
+                if let Some(limit) = footprint.limit {
+                    batch.push("acct_store_limit_bytes", &none, limit as f64);
+                }
+            }
         }
 
         if quiet {

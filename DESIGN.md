@@ -536,6 +536,39 @@ a day writes 50 MB of them a day.
 The planes keep the same, so a host with a store of its own and a node
 that pushes to the stack answer the same question with the same memory.
 
+### And no more than it is allowed
+
+Windows are a forecast: right for an ordinary server, and wrong for the
+one that ends a million processes a day. What prevents "oops, I filled
+your server" is a cap. `--store-limit 2G` is one, and with it the
+windows can be generous and the limit does the respecting.
+
+Measuring is the easy part: the pages in use of each database, and its
+write-ahead log, after the pass has truncated the logs. Free pages are
+not counted, since they are given back at the next vacuum, and counting
+them would have the cap prune twice for one overrun.
+
+What goes first is the decision. By age alone, all kinds alike, is the
+simplest to explain, and throws away cheap records to keep expensive
+samples. So it is by value: samples, then spans, then rollups from the
+finest, then records, which are the audit trail at forty bytes each and
+go last. Within a kind, the oldest first, a tenth of what is held at a
+time, so that it converges in a few rounds. Pruning is chunk-granular;
+a chunk that reaches past the cutoff stays whole, and a round that moved
+nothing doubles its step rather than giving up. A rollup tier is judged
+by its reach alone, because the pass that applies its new window merges
+its chunks too, and that frees bytes without giving anything up.
+
+The engine prunes samples, spans, and records to a cutoff on request. A
+rollup tier it prunes only to its window, so the cap shortens the window
+and lets the next pass apply it, and the tier keeps the shorter window
+after: the limit is the authority, and a ladder that was set once by a
+flag is now what the limit left of it.
+
+Tried on a copy of the development host's store, 376 MB of 26 hours
+with a limit of 120 MB: samples back to the last two hours, spans back
+to a day, the rollups and the records untouched, in two lines of log.
+
 ### Why every hour
 
 The servers compact every five minutes, and the collector's first version

@@ -412,7 +412,13 @@ of their own, by command name (`comm`) and by user (`user`).
 
 `acct_processes`, `acct_processes_reported`, `acct_sweep_seconds`,
 `acct_exits`, `acct_exits_lost`, `acct_execs`, `acct_execs_missed`,
-`acct_execs_lost`.
+`acct_execs_lost`, `acct_interval_seconds`,
+`acct_process_interval_seconds`; and with a store of its own,
+`acct_store_bytes` and `acct_store_limit_bytes`.
+
+The two intervals are what the collector was started with, so that a
+reader elsewhere can take its lookback from the store rather than be
+told: three times `acct_process_interval_seconds`, by host.
 
 A rising `acct_exits_lost` means processes are ending faster than their
 records can be read. Up to 262,144 wait between two sweeps, which at the
@@ -803,6 +809,7 @@ minutes.
 | `--rollups` | `5m@30d,1h@180d` | local store: coarser copies kept after that |
 | `--log-retention` | `30d` | local store: how long accounting records are kept |
 | `--trace-retention` | `30d` | local store: how long spans are kept |
+| `--store-limit` | `2G` | local store: what it may hold on disk; `0` for no limit |
 | `--token` | | planes: a bearer token, if they require one |
 
 Sampling faster or slower, and what it costs, is under [How
@@ -815,6 +822,19 @@ for samples and spans as it does for records
 ([timeless-libsql#91](https://github.com/awksedgreep/timeless-libsql/issues/91)).
 For the planes, the windows are the planes' own settings, and the same
 ones.
+
+**The limit** is what keeps a store from filling a disk whatever the
+windows say. At each maintenance pass the collector measures the three
+databases and their logs, less the pages SQLite has freed, and while they
+are over the limit it prunes the oldest of the least valuable kind:
+samples first, then spans, then rollups finest first, then records. The
+last hour of anything is never pruned; if the store is still over the
+limit with only that, the collector says so and goes on. Pruning is
+chunk-granular, so it lands a little under the limit, and the store can
+be over it by an hour's writes between passes. What was pruned is in the
+log, one line a kind, and the store's size and limit are among the
+`acct_*` gauges. A rollup tier that is pruned is given a shorter window,
+and keeps it.
 
 Why these: a week of samples is enough to fight a fire with, and samples
 are most of the bytes. Six months has its value at one resolution, the

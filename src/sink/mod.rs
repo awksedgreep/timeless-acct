@@ -46,4 +46,17 @@ pub trait Sink {
 
     /// A line for the startup banner.
     fn describe(&self) -> String;
+
+    /// What the sink holds on disk, and what it may: for a sink that has
+    /// a disk.
+    fn footprint(&self) -> Option<Footprint> {
+        None
+    }
+}
+
+/// What a store takes on disk, in bytes, and what it is allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Footprint {
+    pub bytes: u64,
+    pub limit: Option<u64>,
 }

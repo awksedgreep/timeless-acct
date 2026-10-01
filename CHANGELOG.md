@@ -25,6 +25,19 @@
   holds every process that ever lived. They apply to a store when it is
   created; an existing store keeps what it was made with. (#10)
 
+- A limit on what the local store may hold: `--store-limit`, 2 GiB
+  unless told otherwise. Over it, the collector prunes the oldest of the
+  least valuable kind at each maintenance pass, samples first and records
+  last, never into the last hour. The store's size and limit are
+  `acct_store_bytes` and `acct_store_limit_bytes`. (#11)
+- `acct_interval_seconds` and `acct_process_interval_seconds` say how
+  often the collector was told to look, so a reader can choose its
+  lookback from the store. (#9)
+- The engine is the one with series removed by retention, rollup chunks
+  merged, and a changed window applied at the next pass
+  (timeless-libsql `5bca399`). With the defaults, a series now goes with
+  its hourly rollup after 180 days instead of staying forever.
+
 ## 0.2.1
 
 - After a burst of processes the collector comes back to near the size
