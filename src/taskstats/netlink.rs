@@ -65,14 +65,15 @@ fn request(
     payload: &[u8],
 ) -> Vec<u8> {
     let attr_len = ATTR_HEADER + payload.len();
-    let mut body = Vec::with_capacity(GENL_HEADER + align4(attr_len));
+    let attr_len = u16::try_from(attr_len).expect("taskstats payload fits in an attribute");
+    let mut body = Vec::with_capacity(GENL_HEADER + align4(attr_len as usize));
     body.push(command);
     body.push(version);
     body.extend_from_slice(&0_u16.to_ne_bytes());
-    body.extend_from_slice(&(attr_len as u16).to_ne_bytes());
+    body.extend_from_slice(&attr_len.to_ne_bytes());
     body.extend_from_slice(&kind.to_ne_bytes());
     body.extend_from_slice(payload);
-    body.resize(GENL_HEADER + align4(attr_len), 0);
+    body.resize(GENL_HEADER + align4(attr_len as usize), 0);
     message(family, flags, &body)
 }
 
@@ -97,7 +98,14 @@ impl Socket {
         socket.family = socket.resolve_family()?;
         socket.netlink.grow_receive_buffer()?;
 
-        let mut mask = cpus.trim().as_bytes().to_vec();
+        let trimmed = cpus.trim();
+        if trimmed.is_empty() || trimmed.bytes().any(|b| b == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty CPU list for taskstats registration",
+            ));
+        }
+        let mut mask = trimmed.as_bytes().to_vec();
         mask.push(0);
         socket.command(TASKSTATS_CMD_ATTR_REGISTER_CPUMASK, &mask)?;
         socket.cpus = mask;
@@ -159,8 +167,11 @@ impl Socket {
         ))?;
         let mut buf = vec![0_u8; 8192];
         // Exit records may already be arriving; the verdict is the first
-        // error-typed message among them.
-        for _ in 0..64 {
+        // error-typed message among them. Bounded so a storm of records
+        // cannot hold registration forever; large so it does not time out
+        // spuriously while they arrive. Replies are not correlated by
+        // sequence: one command is outstanding at a time.
+        for _ in 0..1024 {
             let Received::Data(len) = self.netlink.receive(&mut buf)? else {
                 break;
             };

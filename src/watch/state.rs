@@ -174,6 +174,11 @@ impl State {
         let Some((first, last)) = range else {
             return Changed::Nothing;
         };
+        // Going back from now lands on what the store holds.
+        if self.at.is_none() && seconds < 0.0 {
+            self.at = Some(last);
+            return Changed::Moment;
+        }
         let from = self.at.unwrap_or(last + self.step);
         let to = ((from + seconds) / self.step).floor() * self.step;
         let moved = if to > last { None } else { Some(to.max(first)) };
@@ -380,19 +385,21 @@ impl State {
 
     fn wanted(&self, texts: &[&str]) -> bool {
         let filter = self.filter.to_lowercase();
-        filter.is_empty()
-            || texts
-                .iter()
-                .any(|text| text.to_lowercase().contains(&filter))
+        Self::matches(&filter, texts)
+    }
+
+    fn matches(filter: &str, texts: &[&str]) -> bool {
+        filter.is_empty() || texts.iter().any(|text| text.to_lowercase().contains(filter))
     }
 
     /// The units to show, in the order to show them.
     pub fn units<'a>(&self, snapshot: &'a Snapshot) -> Vec<&'a Unit> {
+        let filter = self.filter.to_lowercase();
         let mut rows: Vec<&Unit> = snapshot
             .units
             .iter()
             .filter(|unit| self.sums || !is_sum(&unit.name))
-            .filter(|unit| self.wanted(&[&unit.name]))
+            .filter(|unit| Self::matches(&filter, &[&unit.name]))
             .collect();
         let sort = self.sort;
         order(&mut rows, sort, |unit| match sort {
@@ -406,11 +413,12 @@ impl State {
 
     /// The processes to show, in the order to show them.
     pub fn processes<'a>(&self, snapshot: &'a Snapshot) -> Vec<&'a Process> {
+        let filter = self.filter.to_lowercase();
         let mut rows: Vec<&Process> = snapshot
             .processes
             .iter()
             .filter(|p| self.within.as_ref().is_none_or(|unit| *unit == p.unit))
-            .filter(|p| self.wanted(&[&p.name, &p.user]))
+            .filter(|p| Self::matches(&filter, &[&p.name, &p.user]))
             .collect();
         let sort = self.sort;
         order(&mut rows, sort, |process| match sort {

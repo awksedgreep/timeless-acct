@@ -388,16 +388,29 @@ fn unescape_mount(path: &str) -> String {
 
 /// A kernel CPU list (`0-21`, `0-3,8-11`) as the number of CPUs it names.
 pub fn cpu_list_len(text: &str) -> usize {
-    text.trim()
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    trimmed
         .split(',')
         .filter(|part| !part.is_empty())
         .map(|part| match part.split_once('-') {
             Some((low, high)) => {
-                let low: usize = low.parse().unwrap_or(0);
-                let high: usize = high.parse().unwrap_or(low);
-                high.saturating_sub(low) + 1
+                let (Ok(low), Ok(high)) = (low.parse::<usize>(), high.parse::<usize>()) else {
+                    return 0;
+                };
+                if high < low {
+                    return 0;
+                }
+                high - low + 1
             }
-            None => 1,
+            None => {
+                if part.parse::<usize>().is_err() {
+                    return 0;
+                }
+                1
+            }
         })
         .sum()
 }

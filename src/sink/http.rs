@@ -12,7 +12,7 @@ use crate::encode::{ndjson, otlp_json, prometheus_text};
 
 use super::{Sink, Tick};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpOptions {
     pub metrics_url: String,
     pub logs_url: String,
@@ -23,6 +23,22 @@ pub struct HttpOptions {
     /// Ticks kept while a plane is unreachable. At a ten-second interval
     /// the default holds an hour.
     pub backlog: usize,
+}
+
+impl std::fmt::Debug for HttpOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpOptions")
+            .field("metrics_url", &self.metrics_url)
+            .field("logs_url", &self.logs_url)
+            .field("traces_url", &self.traces_url)
+            .field(
+                "token",
+                &self.token.as_ref().map(|_| "***"),
+            )
+            .field("timeout", &self.timeout)
+            .field("backlog", &self.backlog)
+            .finish()
+    }
 }
 
 impl Default for HttpOptions {
@@ -96,6 +112,9 @@ impl HttpSink {
             Ok(_) => Ok(()),
             Err(ureq::Error::Status(code, response)) => {
                 let detail = response.into_string().unwrap_or_default();
+                // A compromised plane could answer with gigabytes; what is
+                // logged is the head of it.
+                let detail: String = detail.chars().take(500).collect();
                 Err(anyhow!("{url} answered {code}: {}", detail.trim()))
             }
             Err(error) => Err(anyhow!("{url}: {error}")),

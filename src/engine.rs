@@ -14,8 +14,9 @@ use crate::collect::process::{ExitedCpu, ProcessCollector, Tracked, Units};
 use crate::collect::system::SystemCollector;
 use crate::collect::units::UnitCollector;
 use crate::collect::users::Users;
+use crate::encode::{ndjson, otlp_json, prometheus_text};
 use crate::lineage::{Lineage, Seen, START_TOLERANCE};
-use crate::model::{no_labels, Event, MetricBatch, Span};
+use crate::model::{labels, no_labels, Event, MetricBatch, Span};
 use crate::procevents::{Exec, ExecListener};
 use crate::procfs::process::{group_name, is_launcher, parse_pid_stat};
 use crate::procfs::ProcRoot;
@@ -67,8 +68,9 @@ struct Sources<'a> {
     processes: Option<&'a ProcessCollector>,
     described: &'a HashMap<u32, Exec>,
     unexplained: &'a [Tracked],
-    /// Processes whose exit is being accounted in this same tick.
-    ending: &'a HashMap<u32, Seen>,
+    /// Processes whose exit is being accounted in this same tick. A pid
+    /// may appear more than once if it was reused within the batch.
+    ending: &'a HashMap<u32, Vec<Seen>>,
     root: &'a ProcRoot,
     clock: Clock,
 }
@@ -116,7 +118,11 @@ impl Sources<'_> {
         if let Some(exec) = self.described.get(&pid) {
             return Some(seen_exec(exec));
         }
-        if let Some(seen) = self.ending.get(&pid) {
+        if let Some(seen) = self
+            .ending
+            .get(&pid)
+            .and_then(|candidates| candidates.iter().max_by(|a, b| a.start_epoch.total_cmp(&b.start_epoch)))
+        {
             return Some(*seen);
         }
         let mut buf = String::new();
@@ -155,6 +161,11 @@ pub struct Engine {
     described: HashMap<u32, Exec>,
     exits_seen: u64,
     write_failures: u64,
+    /// Wire-equivalent bytes produced per plane, cumulative: the bodies the
+    /// encoders render, whether they go to the planes or a store of their
+    /// own. `rate(acct_written_bytes_total[1h])` against
+    /// `rate(acct_store_bytes[1h])` is the compression over any window.
+    written: [u64; 3],
 }
 
 /// The next multiple of `interval` strictly after `after`, in epoch
@@ -176,6 +187,7 @@ impl Engine {
             described: HashMap::new(),
             exits_seen: 0,
             write_failures: 0,
+            written: [0; 3],
         }
     }
 
@@ -242,7 +254,8 @@ impl Engine {
         }
 
         // What ended since the last sweep is accounted before closing.
-        self.tick(epoch_now().round() as i64, false, true, true);
+        let now_epoch = epoch_now();
+        self.tick(now_epoch.round() as i64, false, true, true);
         let unexplained = std::mem::take(&mut self.unexplained);
         let identities: Vec<_> = unexplained
             .iter()
@@ -250,10 +263,10 @@ impl Engine {
             .collect();
         let leftover: Vec<Event> = unexplained
             .iter()
-            .map(|tracked| vanished_event(tracked, epoch_now()))
+            .map(|tracked| vanished_event(tracked, now_epoch))
             .collect();
         if !leftover.is_empty() {
-            let batch = MetricBatch::new(epoch_now() as i64);
+            let batch = MetricBatch::new(now_epoch as i64);
             let spans: Vec<Span> = leftover
                 .iter()
                 .zip(&identities)
@@ -303,11 +316,13 @@ impl Engine {
             // Everything heard of since the last tick is laid out before
             // any of it is given its place. A child is heard of before its
             // parent as often as after: a subshell calls exec after what
-            // it ran did, and ends after it too.
-            let ending: HashMap<u32, Seen> = exits
-                .iter()
-                .map(|exit| (exit.pid, seen_exit(exit)))
-                .collect();
+            // it ran did, and ends after it too. Keyed by pid with all
+            // incarnations kept so pid reuse within a batch does not
+            // collapse two exits into one.
+            let mut ending: HashMap<u32, Vec<Seen>> = HashMap::new();
+            for exit in &exits {
+                ending.entry(exit.pid).or_default().push(seen_exit(exit));
+            }
             for seen in execs {
                 self.place(seen, wall, &ending);
             }
@@ -326,8 +341,11 @@ impl Engine {
                     .iter()
                     .filter_map(|pid| collector.get(*pid).map(seen_tracked))
                     .collect();
-                for seen in admitted {
-                    self.place(seen, wall, &HashMap::new());
+                {
+                    let empty: HashMap<u32, Vec<Seen>> = HashMap::new();
+                    for seen in admitted {
+                        self.place(seen, wall, &empty);
+                    }
                 }
                 self.account_vanished(sweep.vanished, wall, &mut events, &mut spans);
             }
@@ -364,6 +382,25 @@ impl Engine {
                 if let Some(limit) = footprint.limit {
                     batch.push("acct_store_limit_bytes", &none, limit as f64);
                 }
+            }
+            // What this tick would cost on the wire, whether it goes there
+            // or into a store: the bodies the encoders render. Counted
+            // before these very samples join the batch, so the count is
+            // three lines short of what leaves; against hundreds of
+            // kilobytes a tick, that is dust.
+            let host = &self.parts.host;
+            self.written[0] += prometheus_text(host, &batch).len() as u64;
+            self.written[1] += ndjson(host, &events).len() as u64;
+            self.written[2] += otlp_json(host, &spans).len() as u64;
+            for (plane, total) in ["metrics", "logs", "traces"]
+                .into_iter()
+                .zip(self.written)
+            {
+                batch.push(
+                    "acct_written_bytes_total",
+                    &labels(vec![("plane", plane.into())]),
+                    total as f64,
+                );
             }
         }
 
@@ -451,7 +488,7 @@ impl Engine {
     }
 
     /// Give a process its place in a trace, if traces are kept.
-    fn place(&mut self, seen: Seen, wall: f64, ending: &HashMap<u32, Seen>) {
+    fn place(&mut self, seen: Seen, wall: f64, ending: &HashMap<u32, Vec<Seen>>) {
         let Some(lineage) = &mut self.parts.lineage else {
             return;
         };
@@ -480,7 +517,7 @@ impl Engine {
     fn account_exits(
         &mut self,
         exits: Vec<ProcessExit>,
-        ending: &HashMap<u32, Seen>,
+        ending: &HashMap<u32, Vec<Seen>>,
         wall: f64,
         events: &mut Vec<Event>,
         spans: &mut Vec<Span>,
@@ -508,18 +545,30 @@ impl Engine {
         }
 
         let mut exited = Vec::new();
+        // Index the sweep-waiting by pid once: a linear scan per exit is
+        // quadratic across a fork storm that leaves thousands waiting.
+        let mut waiting_by_pid: HashMap<u32, Vec<Tracked>> = HashMap::new();
+        for tracked in std::mem::take(&mut self.unexplained) {
+            waiting_by_pid.entry(tracked.pid).or_default().push(tracked);
+        }
         for exit in exits {
             self.exits_seen += 1;
             let same = |start: f64| (start - exit.start_epoch).abs() <= START_TOLERANCE;
 
             // Known from sampling: either still tracked, or found gone by
             // the last sweep and waiting here for this record.
-            let waiting = self
-                .unexplained
-                .iter()
-                .position(|t| t.pid == exit.pid && same(t.start_epoch));
-            let tracked = match waiting {
-                Some(index) => Some(self.unexplained.swap_remove(index)),
+            let tracked = match waiting_by_pid.get_mut(&exit.pid) {
+                Some(candidates) => match candidates
+                    .iter()
+                    .position(|t| same(t.start_epoch))
+                {
+                    Some(index) => Some(candidates.swap_remove(index)),
+                    None => None,
+                },
+                None => None,
+            };
+            let tracked = match tracked {
+                Some(tracked) => Some(tracked),
                 None => self.parts.processes.as_mut().and_then(|collector| {
                     collector
                         .find(exit.pid, exit.start_epoch, START_TOLERANCE)
@@ -530,10 +579,15 @@ impl Engine {
             };
             // Known from its exec. The pid alone is not enough: it may have
             // belonged to an earlier process whose exit record was lost.
-            let described = self
-                .described
-                .remove(&exit.pid)
-                .filter(|exec| tracked.is_none() && same(exec.start_epoch));
+            // Only remove on match: a delayed exit for an old incarnation
+            // must not drop the live incarnation's exec record after pid
+            // reuse.
+            let described = match self.described.get(&exit.pid) {
+                Some(exec) if tracked.is_none() && same(exec.start_epoch) => {
+                    self.described.remove(&exit.pid)
+                }
+                _ => None,
+            };
 
             let user = self.users.name(exit.uid).to_string();
             let was = self.what_it_was(&exit, tracked.as_ref(), described.as_ref());
@@ -573,6 +627,8 @@ impl Engine {
             }
             events.push(record);
         }
+        // What no exit claimed waits for the next sweep's records.
+        self.unexplained = waiting_by_pid.into_values().flatten().collect();
         exited
     }
 
@@ -627,11 +683,11 @@ impl Engine {
                 };
             }
             // A parent that has not lived to a sweep itself.
-            if let Some(parent) = self
-                .described
-                .get(&exit.ppid)
-                .filter(|p| p.comm == exit.comm && p.start_epoch <= exit.start_epoch + 1.0)
-            {
+            if let Some(parent) = self.described.get(&exit.ppid).filter(|p| {
+                p.comm == exit.comm
+                    && p.start_epoch <= exit.start_epoch + START_TOLERANCE
+                    && exit.start_epoch <= p.start_epoch + START_TOLERANCE
+            }) {
                 return Described {
                     started_as: String::new(),
                     ..from_exec(parent)
@@ -935,10 +991,10 @@ mod tests {
             start_epoch: BOOT + 60.5,
             ..exit("cc", 900, false)
         };
-        let ending: HashMap<u32, Seen> = [&child, &parent]
-            .into_iter()
-            .map(|exit| (exit.pid, seen_exit(exit)))
-            .collect();
+        let mut ending: HashMap<u32, Vec<Seen>> = HashMap::new();
+        for exit in [&child, &parent] {
+            ending.entry(exit.pid).or_default().push(seen_exit(exit));
+        }
         // In the order their records come: the child's first.
         engine.place(seen_exit(&child), BOOT + 70.0, &ending);
         engine.place(seen_exit(&parent), BOOT + 70.0, &ending);

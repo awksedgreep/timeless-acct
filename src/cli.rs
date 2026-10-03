@@ -530,10 +530,14 @@ pub fn parse_size(text: &str) -> anyhow::Result<Option<u64>> {
     let number: f64 = number.trim().parse().map_err(|_| {
         anyhow::anyhow!("{text:?} is not a size: expected 2G, 500M, or 0 for no limit")
     })?;
-    if number.is_nan() || number <= 0.0 {
+    if number.is_nan() || number <= 0.0 || !number.is_finite() {
         anyhow::bail!("{text:?} is not a size: expected 2G, 500M, or 0 for no limit");
     }
-    Ok(Some((number * scale) as u64))
+    let bytes = number * scale;
+    if !bytes.is_finite() || bytes > u64::MAX as f64 {
+        anyhow::bail!("{text:?} is not a size: out of range");
+    }
+    Ok(Some(bytes as u64))
 }
 
 #[cfg(test)]

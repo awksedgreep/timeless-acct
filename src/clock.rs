@@ -19,7 +19,11 @@ pub fn parse(text: &str, now: f64) -> Result<f64> {
         return Ok(now - parse_span(back)?);
     }
     if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(text.parse()?);
+        let epoch: f64 = text.parse()?;
+        if !epoch.is_finite() {
+            bail!("{text:?} is not a time: out of range");
+        }
+        return Ok(epoch);
     }
 
     let (date, time) = match text.split_once([' ', 'T']) {
@@ -34,9 +38,14 @@ pub fn parse(text: &str, now: f64) -> Result<f64> {
         let [year, month, day] = parts[..] else {
             bail!("{text:?} is not a time: expected a date as YYYY-MM-DD");
         };
+        let month: i32 = month.parse()?;
+        let day: i32 = day.parse()?;
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            bail!("{text:?} is not a date: expected YYYY-MM-DD");
+        }
         tm.tm_year = year.parse::<i32>()? - 1900;
-        tm.tm_mon = month.parse::<i32>()? - 1;
-        tm.tm_mday = day.parse()?;
+        tm.tm_mon = month - 1;
+        tm.tm_mday = day;
     }
     let (mut hour, mut minute, mut second) = (0, 0, 0);
     if let Some(time) = time {
@@ -107,6 +116,24 @@ pub fn format(epoch: f64) -> String {
         tm.tm_hour,
         tm.tm_min,
         tm.tm_sec
+    )
+}
+
+/// `14:30:05`, local time: the clock part of [`format`].
+pub fn time(epoch: f64) -> String {
+    let tm = local(epoch);
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// `09-29 14:30`, local time: the day and the clock without seconds.
+pub fn day_time(epoch: f64) -> String {
+    let tm = local(epoch);
+    format!(
+        "{:02}-{:02} {:02}:{:02}",
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
     )
 }
 

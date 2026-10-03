@@ -8,7 +8,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -93,6 +93,8 @@ fn lease(database: &Path) -> Result<File> {
         .write(true)
         .open(&path)
         .with_context(|| format!("open owner lease {}", path.display()))?;
+    // The lease sits beside a store of command lines: owner-only like it.
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     // SAFETY: flock takes a descriptor this function owns.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
@@ -108,6 +110,8 @@ fn lease(database: &Path) -> Result<File> {
 /// tables available on the connection.
 pub fn open(path: &Path) -> Result<Connection> {
     let connection = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+    // A store holds command lines: owner-only, whatever the umask says.
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     // auto_vacuum comes first: it can only be chosen while the database is
     // empty, and switching to WAL writes the header that ends that. The
     // page size is the traces server's, for the same reason and at the
@@ -1079,6 +1083,13 @@ mod tests {
         let _sink = EmbeddedSink::open(&options).unwrap();
         let mode = fs::metadata(&options.dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+        for db in [METRICS_DB, LOGS_DB, TRACES_DB] {
+            let mode = fs::metadata(options.dir.join(db))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{db}");
+        }
     }
 
     #[test]

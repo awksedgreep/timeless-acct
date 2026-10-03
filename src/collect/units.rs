@@ -110,7 +110,8 @@ impl UnitCollector {
     ) {
         let interval = self
             .previous_at
-            .map(|at| now.duration_since(at).as_secs_f64())
+            .and_then(|at| now.checked_duration_since(at))
+            .map(|d| d.as_secs_f64())
             .filter(|seconds| *seconds > 0.0);
 
         let mut groups = Vec::new();

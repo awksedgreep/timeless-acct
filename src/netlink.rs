@@ -175,16 +175,40 @@ impl Netlink {
         };
         if sent < 0 {
             Err(io::Error::last_os_error())
+        } else if (sent as usize) != bytes.len() {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short send on a netlink socket",
+            ))
         } else {
             Ok(())
         }
     }
 
-    /// Read one datagram into `buf`.
+    /// Read one datagram into `buf`. A datagram larger than the buffer is
+    /// reported as an overrun rather than handed over truncated: a half
+    /// datagram walks to zero records and hides the loss.
     pub fn receive(&self, buf: &mut [u8]) -> io::Result<Received> {
-        // SAFETY: the pointer and length describe `buf` exactly.
-        let len = unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        // SAFETY: the iovec describes `buf` exactly; the message header is
+        // plain data filled by the call.
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+        header.msg_iov = &mut iov;
+        header.msg_iovlen = 1;
+        let len = unsafe {
+            libc::recvmsg(
+                self.fd.as_raw_fd(),
+                &mut header,
+                libc::MSG_TRUNC as libc::c_int,
+            )
+        };
         if len >= 0 {
+            if header.msg_flags & libc::MSG_TRUNC != 0 {
+                return Ok(Received::Overrun);
+            }
             return Ok(Received::Data(len as usize));
         }
         let error = io::Error::last_os_error();

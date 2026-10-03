@@ -215,6 +215,14 @@ pub fn exits(args: &ExitsArgs) -> Result<()> {
         }
     }
     sql.push_str(" ORDER BY ts DESC");
+    // User and unit are read from each record, not indexed: only bound the
+    // store's work when every filter is one it can apply itself and this is
+    // a listing, not a summary over the whole window.
+    let rust_filtered = args.user.is_some() || args.unit.is_some();
+    if !args.summary && !rust_filtered {
+        values.push(Sql::Integer(args.count as i64));
+        sql.push_str(&format!(" LIMIT ?{}", values.len()));
+    }
 
     let mut statement = connection.prepare(&sql)?;
     let mut rows = statement.query(params_from_iter(values))?;
@@ -503,9 +511,12 @@ pub fn trees(args: &TreesArgs) -> Result<()> {
     let connection = open(&args.data_dir, TRACES_DB)?;
 
     // The jobs with a process that started in the window and is what was
-    // asked for. Each of these is pushed down into the store.
+    // asked for. Each of these is pushed down into the store. Grouped and
+    // ordered there so only the latest candidates are read back as trees:
+    // loading every trace's spans (N+1) sorted in RAM on a busy store.
+    // Over-fetch to allow for the min_processes cut below.
     let mut sql =
-        format!("SELECT DISTINCT trace_id FROM {TRACES_TABLE} WHERE start_ts BETWEEN ?1 AND ?2");
+        format!("SELECT trace_id, MAX(start_ts) AS started FROM {TRACES_TABLE} WHERE start_ts BETWEEN ?1 AND ?2");
     let mut values: Vec<Sql> = vec![
         Sql::Integer((since * 1e9) as i64),
         Sql::Integer((until * 1e9) as i64),
@@ -525,6 +536,10 @@ pub fn trees(args: &TreesArgs) -> Result<()> {
     if args.failed {
         sql.push_str(" AND status = 'error'");
     }
+    sql.push_str(" GROUP BY trace_id ORDER BY started DESC");
+    let fetch = args.count.saturating_add(50).max(50) as i64;
+    values.push(Sql::Integer(fetch));
+    sql.push_str(&format!(" LIMIT ?{}", values.len()));
     let traces: Vec<Vec<u8>> = connection
         .prepare(&sql)?
         .query_map(params_from_iter(values), |row| row.get(0))?
@@ -532,12 +547,14 @@ pub fn trees(args: &TreesArgs) -> Result<()> {
 
     let mut jobs: Vec<(Vec<u8>, Vec<Node>)> = Vec::new();
     for trace in traces {
+        if jobs.len() >= args.count {
+            break;
+        }
         let all = nodes(&connection, &trace)?;
         if all.len() >= args.min_processes {
             jobs.push((trace, all));
         }
     }
-    jobs.sort_by_key(|(_, all)| std::cmp::Reverse(all.iter().map(|n| n.start_ns).min()));
 
     if jobs.is_empty() {
         println!("(none)");
@@ -577,9 +594,6 @@ pub fn trees(args: &TreesArgs) -> Result<()> {
             println!("  {line}");
         }
         println!();
-    }
-    if jobs.len() > args.count {
-        println!("({} more jobs)", jobs.len() - args.count);
     }
     Ok(())
 }

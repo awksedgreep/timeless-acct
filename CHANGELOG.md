@@ -1,5 +1,39 @@
 # Changes
 
+## 0.2.2
+
+- What each tick costs on the wire is counted, so a store can show wire
+  against stored: `acct_written_bytes_total{plane="metrics"|"logs"|"traces"}`,
+  cumulative from the bodies the encoders render. `rate(acct_written_bytes_total[1h])`
+  against `rate(acct_store_bytes[1h])` is the compression over any window. (#13)
+
+- The Jobs view no longer reads two hundred trees to show one. Figures
+  come from one scan of the reach; the selected row's tree is read for it
+  alone. (#8)
+
+- Correctness fixes: the queue counter increments before the send so a
+  concurrent drain cannot leak capacity (#14); a failed `/proc` read keeps
+  what tracking knew instead of attributing uid-0 defaults (#15); a
+  delayed exit for an old pid incarnation no longer drops the live one's
+  exec record, and exits sharing a pid in one batch no longer collapse
+  (#16); `watch` and the store respect `--host` in history, timeline,
+  incidents, exits, records, and jobs (#17); `exits` bounds the store's
+  work with `LIMIT` and `trees` orders and limits in SQL (#18).
+
+- Hardening: the bearer token is redacted from `Debug`, db and lease files
+  are `0600`, error bodies are capped (#19); exec descriptions re-read
+  `stat` to drop pid-reuse mismatches (#20); netlink checks short sends,
+  reports truncation as overrun, widens the ACK window, validates the CPU
+  list, and backs off error spam (#21).
+
+- Performance: the exit wait is indexed by pid, OTLP grouping is
+  single-pass, fd walks are gated on reportable processes, label caches
+  are pruned (#22).
+
+- The viewer: `check` shares one HTTP agent, hunt dedup is bounded, `go`
+  clamps stale selections, shifting from live lands on the last stored
+  moment, and time fields no longer byte-slice the clock (#23, #24).
+
 ## Not yet in a version
 
 - The viewer keeps the pace of the store. It took samples to be ten

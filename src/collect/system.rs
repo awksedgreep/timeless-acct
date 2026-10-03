@@ -126,7 +126,10 @@ impl SystemCollector {
         self.energy(&mut reading);
 
         if let Some(previous) = self.previous.take() {
-            let seconds = now.duration_since(previous.at).as_secs_f64();
+            let seconds = now
+                .checked_duration_since(previous.at)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
             if seconds > 0.0 {
                 self.cpu(batch, &previous, &reading);
                 self.activity(batch, &previous, &reading, seconds);

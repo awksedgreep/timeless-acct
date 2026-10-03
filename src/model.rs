@@ -65,11 +65,13 @@ impl MetricBatch {
 /// subject's behaviour. Storing them costs bytes on the wire and defeats
 /// the store's compression, which does best on short decimals.
 pub fn measured(value: f64) -> f64 {
-    if value.abs() >= 1000.0 {
+    let rounded = if value.abs() >= 1000.0 {
         value.round()
     } else {
         (value * 1000.0).round() / 1000.0
-    }
+    };
+    // Rounding can produce negative zero, which renders as "-0".
+    if rounded == 0.0 { 0.0 } else { rounded }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

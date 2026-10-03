@@ -307,7 +307,8 @@ impl ProcessCollector {
         self.generation += 1;
         let interval = self
             .previous_sweep
-            .map(|(at, _)| now.duration_since(at).as_secs_f64())
+            .and_then(|(at, _)| now.checked_duration_since(at))
+            .map(|d| d.as_secs_f64())
             .filter(|seconds| *seconds > 0.0);
         let previous_wall = self.previous_sweep.map(|(_, wall)| wall);
 
@@ -358,27 +359,50 @@ impl ProcessCollector {
             }
 
             let current = self.read_counters(pid, &stat);
-            let status = {
-                let _ = self.root.read_pid(pid, "status", &mut self.buf);
-                parse_pid_status(&self.buf)
-            };
-            let fds = fs::read_dir(self.root.pid_path(pid, "fd"))
+            // read_pid clears the buffer first, so a failed read leaves it
+            // empty: only parse on success, otherwise keep what tracking
+            // already knows instead of attributing defaults (uid 0) to it.
+            let status = self
+                .root
+                .read_pid(pid, "status", &mut self.buf)
                 .ok()
-                .map(|entries| entries.count());
-            let user = if self.tracked[&pid].uid == status.uid {
-                None
-            } else {
-                Some(self.users.name(status.uid).to_string())
+                .map(|()| parse_pid_status(&self.buf));
+            let Some(previous) = self.tracked.get(&pid) else {
+                continue;
+            };
+            // Counting file descriptors walks every fd of every process:
+            // only for the few old enough to be reported.
+            let old_enough = wall - previous.start_epoch >= self.options.min_age
+                && !(previous.kernel_thread && !self.options.kernel_threads);
+            let fds = old_enough
+                .then(|| {
+                    fs::read_dir(self.root.pid_path(pid, "fd"))
+                        .ok()
+                        .map(|entries| entries.count())
+                })
+                .flatten();
+            let user = match &status {
+                None => None,
+                Some(status) if previous.uid == status.uid => None,
+                Some(status) => Some(self.users.name(status.uid).to_string()),
             };
             // A process is moved between control groups rarely, and by
             // someone else: a login is moved into its session's scope.
             let cgroup = self.root.cgroup_of(pid, &mut self.buf);
-            let moved = (!cgroup.is_empty() && self.tracked[&pid].cgroup != cgroup)
+            let moved = (!cgroup.is_empty() && previous.cgroup != cgroup)
                 .then(|| (unit_of(&cgroup, &mut self.users, &self.containers), cgroup));
 
             let tracked = self.tracked.get_mut(&pid).expect("checked above");
+            let switches = match status.as_ref() {
+                Some(status) => {
+                    status.voluntary_switches + status.involuntary_switches
+                }
+                // Unreadable: carry the last count forward so the rate is
+                // zero rather than a spike or a reset.
+                None => tracked.last.switches,
+            };
             let counters = Counters {
-                switches: status.voluntary_switches + status.involuntary_switches,
+                switches,
                 ..current
             };
             let renamed = tracked.comm != stat.comm;
@@ -389,7 +413,9 @@ impl ProcessCollector {
                 tracked.group = group_name(&stat.comm, tracked.kernel_thread).to_string();
             }
             if let Some(user) = user {
-                tracked.uid = status.uid;
+                if let Some(status) = status.as_ref() {
+                    tracked.uid = status.uid;
+                }
                 tracked.user = user;
             }
             if let Some((unit, cgroup)) = moved {
@@ -411,7 +437,7 @@ impl ProcessCollector {
                 tracked.labels = process_labels(pid, &tracked.comm, &tracked.user, &tracked.unit);
             }
 
-            let rss_bytes = match status.rss_kb {
+            let rss_bytes = match status.as_ref().and_then(|s| s.rss_kb) {
                 Some(kb) => kb * 1024,
                 None => stat.rss_pages * self.units.page_bytes,
             };
@@ -422,7 +448,10 @@ impl ProcessCollector {
             tracked.last_seen_epoch = wall;
             tracked.generation = self.generation;
 
-            let seconds = now.duration_since(tracked.last_at).as_secs_f64();
+            let seconds = now
+                .checked_duration_since(tracked.last_at)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
             let before = tracked.last;
             tracked.last = counters;
             tracked.last_at = now;
@@ -490,7 +519,7 @@ impl ProcessCollector {
             if !tracked.kernel_thread {
                 batch.push("proc_rss_bytes", l, rss_bytes as f64);
                 batch.push("proc_vsize_bytes", l, stat.vsize_bytes as f64);
-                if let Some(kb) = status.swap_kb {
+                if let Some(kb) = status.as_ref().and_then(|s| s.swap_kb) {
                     batch.push("proc_swap_bytes", l, kb as f64 * 1024.0);
                 }
             }
@@ -544,8 +573,14 @@ impl ProcessCollector {
     }
 
     fn admit(&mut self, pid: u32, stat: &PidStat, now: Instant, wall: f64) -> Tracked {
-        let _ = self.root.read_pid(pid, "status", &mut self.buf);
-        let status = parse_pid_status(&self.buf);
+        // On failure leave the status empty rather than parsing the cleared
+        // buffer into uid-0 defaults.
+        let status = self
+            .root
+            .read_pid(pid, "status", &mut self.buf)
+            .ok()
+            .map(|()| parse_pid_status(&self.buf))
+            .unwrap_or_default();
         let Described {
             cmdline,
             exe,
@@ -628,6 +663,21 @@ impl ProcessCollector {
         users: HashMap<String, Total>,
         interval: Option<f64>,
     ) {
+        use crate::queue::settle;
+        // Bound the label caches: churn in command names would otherwise
+        // keep an entry forever. Prune to the present when large.
+        if self.group_labels.len() > 4096 {
+            let present: std::collections::HashSet<&str> =
+                groups.keys().map(String::as_str).collect();
+            self.group_labels.retain(|name, _| present.contains(name.as_str()));
+            settle(&mut self.group_labels);
+        }
+        if self.user_labels.len() > 1024 {
+            let present: std::collections::HashSet<&str> =
+                users.keys().map(String::as_str).collect();
+            self.user_labels.retain(|name, _| present.contains(name.as_str()));
+            settle(&mut self.user_labels);
+        }
         let mut groups: Vec<(String, Total)> = groups.into_iter().collect();
         groups.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, total) in groups {

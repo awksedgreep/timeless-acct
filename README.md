@@ -92,7 +92,7 @@ $ timeless-acct trees --comm cc1
 
 ## Status
 
-Version 0.2.1. Collection, both sinks, the viewer, and the three query
+Version 0.2.2. Collection, both sinks, the viewer, and the three query
 commands work and
 are tested against a live kernel, on a host run by systemd with the unified
 control group hierarchy. [What is not here yet](#what-is-not-here-yet)
@@ -413,8 +413,12 @@ of their own, by command name (`comm`) and by user (`user`).
 `acct_processes`, `acct_processes_reported`, `acct_sweep_seconds`,
 `acct_exits`, `acct_exits_lost`, `acct_execs`, `acct_execs_missed`,
 `acct_execs_lost`, `acct_interval_seconds`,
-`acct_process_interval_seconds`; and with a store of its own,
-`acct_store_bytes` and `acct_store_limit_bytes`.
+`acct_process_interval_seconds`,
+`acct_written_bytes_total{plane="metrics"|"logs"|"traces"}`; and with a
+store of its own, `acct_store_bytes` and `acct_store_limit_bytes`.
+
+`rate(acct_written_bytes_total[1h])` against `rate(acct_store_bytes[1h])`
+is what the same data costs on the wire against what it costs kept.
 
 The two intervals are what the collector was started with, so that a
 reader elsewhere can take its lookback from the store rather than be

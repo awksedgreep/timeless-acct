@@ -45,13 +45,17 @@ impl<T> Sender<T> {
     /// False if the queue is full, or there is no one left to take from it.
     pub fn offer(&self, item: T) -> bool {
         // One sender: nothing else adds between the look and the send.
+        // The count is incremented *before* the send so a concurrent drain
+        // cannot take the item without counting it: otherwise send → drain
+        // (subtracts 0) → fetch_add leaks one slot of capacity forever.
         if self.waiting.load(Ordering::Relaxed) >= self.limit {
             return false;
         }
+        self.waiting.fetch_add(1, Ordering::Relaxed);
         if self.items.send(item).is_err() {
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
             return false;
         }
-        self.waiting.fetch_add(1, Ordering::Relaxed);
         true
     }
 }
@@ -60,8 +64,8 @@ impl<T> Receiver<T> {
     /// Everything offered since the last call.
     pub fn drain(&self) -> Vec<T> {
         let taken: Vec<T> = self.items.try_iter().collect();
-        // What is taken was sent, and may not have been counted yet: the
-        // count can fall behind for a moment, and must not go below none.
+        // The sender counts before sending, so the count may briefly exceed
+        // what is in the channel; it must never go below none.
         let _ = self
             .waiting
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |waiting| {

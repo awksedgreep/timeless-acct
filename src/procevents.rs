@@ -65,14 +65,27 @@ pub fn events(datagram: &[u8]) -> Vec<Event> {
         if body.len() < CN_HEADER + EVENT_DATA + 8 {
             continue;
         }
-        let word = |at: usize| u32::from_ne_bytes(body[at..at + 4].try_into().expect("4 bytes"));
-        if word(0) != CN_IDX_PROC || word(4) != CN_VAL_PROC {
+        let word = |at: usize| {
+            body.get(at..at + 4)
+                .and_then(|b| b.try_into().ok())
+                .map(u32::from_ne_bytes)
+        };
+        let (Some(idx), Some(val)) = (word(0), word(4)) else {
+            continue;
+        };
+        if idx != CN_IDX_PROC || val != CN_VAL_PROC {
             continue;
         }
         let event = CN_HEADER;
-        out.push(match word(event + EVENT_WHAT) {
-            PROC_EVENT_NONE => Event::Ack(word(event + ACK_ERROR)),
-            PROC_EVENT_EXEC => Event::Exec(word(event + EXEC_TGID)),
+        let (Some(what), Some(arg)) = (word(event + EVENT_WHAT), word(event + EXEC_TGID)) else {
+            continue;
+        };
+        // EXEC carries the thread in DATA and its process after it; ACK
+        // carries the errno at DATA.
+        let ack = word(event + ACK_ERROR).unwrap_or(0);
+        out.push(match what {
+            PROC_EVENT_NONE => Event::Ack(ack),
+            PROC_EVENT_EXEC => Event::Exec(arg),
             _ => Event::Other,
         });
     }
@@ -140,6 +153,14 @@ pub fn describe(
     if described.cmdline.is_empty() && described.exe.is_empty() {
         return None;
     }
+    // Pid reuse between the two reads: the command line of the next process
+    // under the old pid. Re-read and drop on mismatch rather than describe
+    // one process as another.
+    root.read_pid(pid, "stat", buf).ok()?;
+    let again = parse_pid_stat(buf)?;
+    if again.start_ticks != stat.start_ticks {
+        return None;
+    }
     Some(Exec {
         pid,
         at: epoch_now(),
@@ -192,11 +213,13 @@ impl ExecListener {
             thread::Builder::new()
                 .name("procevents".into())
                 .spawn(move || {
-                    let mut datagram = vec![0_u8; 65_536];
+                    let mut datagram = vec![0_u8; 128 * 1024];
                     let mut buf = String::with_capacity(4096);
+                    let mut failures: u64 = 0;
                     while !stop.load(Ordering::Relaxed) {
                         match netlink.receive(&mut datagram) {
                             Ok(Received::Data(len)) => {
+                                failures = 0;
                                 for event in events(&datagram[..len]) {
                                     let Event::Exec(pid) = event else {
                                         continue;
@@ -224,10 +247,16 @@ impl ExecListener {
                             }
                             Ok(Received::Idle) => {}
                             Ok(Received::Overrun) => {
+                                failures = 0;
                                 counters.lost.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(error) => {
-                                eprintln!("timeless-acct: process events read failed: {error}");
+                                failures += 1;
+                                if failures.is_multiple_of(30) || failures == 1 {
+                                    eprintln!(
+                                        "timeless-acct: process events read failed ({failures} so far): {error}"
+                                    );
+                                }
                                 thread::sleep(POLL);
                             }
                         }

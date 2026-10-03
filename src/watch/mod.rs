@@ -300,6 +300,35 @@ impl Watch {
                             Vec::new()
                         };
                         jobs.extend(ended);
+                        // Figures for the list; the selected row's tree is
+                        // read for it alone, and not for two hundred rows.
+                        let rows: Vec<&store::Job> = jobs
+                            .iter()
+                            .filter(|job| self.state.wants(&[&job.said]))
+                            .collect();
+                        self.state.clamp(rows.len());
+                        if let Some(selected) = rows.get(self.state.selected()) {
+                            let trace = selected.trace.clone();
+                            let running = selected.running;
+                            if !running && !trace.is_empty() {
+                                if let Some(job) = jobs
+                                    .iter_mut()
+                                    .find(|job| !job.running && job.trace == trace)
+                                {
+                                    match self.store.job_tree(&trace, self.width) {
+                                        Ok((tree, said)) => {
+                                            job.tree = tree;
+                                            if !said.is_empty() {
+                                                job.said = said;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            self.detail.error = Some(format!("{error:#}"))
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         self.detail.jobs = jobs;
                     }
                     Err(error) => self.detail.error = Some(format!("{error:#}")),
@@ -429,6 +458,17 @@ impl Watch {
         }
         self.detail.exits.sort_by(|a, b| b.at.total_cmp(&a.at));
         self.detail.exits.truncate(ROWS);
+        // The dedup set is for pages overlapping at one instant: keep only
+        // what is shown, not everything scanned past it.
+        if hunt.seen.len() > ROWS * 2 {
+            let kept: HashSet<(i64, u64)> = self
+                .detail
+                .exits
+                .iter()
+                .map(|exit| ((exit.at * 1e6).round() as i64, exit.pid))
+                .collect();
+            hunt.seen.retain(|key| kept.contains(key));
+        }
     }
 
     /// Read the records through to the end: for a screen that is drawn
@@ -530,6 +570,32 @@ impl Watch {
     /// Go to the moment of the selected row: when the process ended, or
     /// when the job began.
     fn go(&mut self) {
+        // Clamp a stale selection before indexing the freshly filtered
+        // list: the filter or the moment may have changed since it moved.
+        match self.state.tab {
+            Tab::Exits => {
+                let rows: Vec<&store::Exit> = self
+                    .detail
+                    .exits
+                    .iter()
+                    .filter(|exit| {
+                        self.state
+                            .wants(&[&exit.command, &exit.unit, &exit.status, &exit.user])
+                    })
+                    .collect();
+                self.state.clamp(rows.len());
+            }
+            Tab::Jobs => {
+                let rows = self
+                    .detail
+                    .jobs
+                    .iter()
+                    .filter(|job| self.state.wants(&[&job.said]))
+                    .count();
+                self.state.clamp(rows);
+            }
+            Tab::Units | Tab::Processes => {}
+        }
         let selected = self.state.selected();
         let at = match self.state.tab {
             Tab::Exits => self

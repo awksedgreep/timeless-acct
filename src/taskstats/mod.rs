@@ -73,10 +73,12 @@ impl Listener {
             thread::Builder::new()
                 .name("taskstats".into())
                 .spawn(move || {
-                    let mut buf = vec![0_u8; 65_536];
+                    let mut buf = vec![0_u8; 128 * 1024];
+                    let mut failures: u64 = 0;
                     while !stop.load(Ordering::Relaxed) {
                         match socket.receive(&mut buf) {
                             Ok(Received::Data(len)) => {
+                                failures = 0;
                                 let at = epoch_now();
                                 for bytes in exit_records(&buf[..len], socket.family()) {
                                     let Some(exit) = record::parse(bytes) else {
@@ -89,11 +91,17 @@ impl Listener {
                             }
                             Ok(Received::Idle) => {}
                             Ok(Received::Overrun) => {
+                                failures = 0;
                                 // The kernel does not say how many.
                                 lost.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(error) => {
-                                eprintln!("timeless-acct: taskstats read failed: {error}");
+                                failures += 1;
+                                if failures.is_multiple_of(30) || failures == 1 {
+                                    eprintln!(
+                                        "timeless-acct: taskstats read failed ({failures} so far): {error}"
+                                    );
+                                }
                                 thread::sleep(POLL);
                             }
                         }

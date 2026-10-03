@@ -97,6 +97,7 @@ pub fn running<'a>(
                 .collect::<Vec<_>>()
                 .join("\n"),
             running: true,
+            trace: Vec::new(),
         });
     }
     jobs.sort_by(|a, b| b.started.total_cmp(&a.started));

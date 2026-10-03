@@ -50,13 +50,17 @@ pub struct Job {
     pub unit: String,
     /// What its first process ran.
     pub command: String,
-    /// Its processes, drawn as the tree they were.
+    /// Its processes, drawn as the tree they were. Loaded on selection;
+    /// empty until then.
     pub tree: Vec<String>,
     /// Everything in it that can be looked for: what each of its
-    /// processes ran, as whom, and where.
+    /// processes ran, as whom, and where. Built when something is looked
+    /// for; empty otherwise, which matches everything.
     pub said: String,
     /// It has not ended: its figures are so far.
     pub running: bool,
+    /// The trace it is, for loading its tree.
+    pub trace: Vec<u8>,
 }
 
 /// A process that ended badly.
@@ -89,7 +93,8 @@ pub struct Store {
     metrics: Connection,
     logs: Connection,
     traces: Option<Connection>,
-    /// As the store's filters spell it.
+    /// The host watched, if one was asked for. A store of one host needs
+    /// no filter; a store of many shows one at a time.
     host: Option<String>,
 }
 
@@ -100,8 +105,23 @@ impl Store {
             logs: open(dir, LOGS_DB)?,
             // A store written before spans were kept has none.
             traces: open(dir, TRACES_DB).ok(),
-            host: host.map(|host| serde_json::json!({ "host": host }).to_string()),
+            host: host.map(str::to_string),
         })
+    }
+
+    /// The metrics filter selecting this host, if one was asked for.
+    fn metrics_filter(&self, mut extra: serde_json::Map<String, Value>) -> String {
+        if let Some(host) = &self.host {
+            extra.insert("host".into(), (*host).clone().into());
+        }
+        Value::Object(extra).to_string()
+    }
+
+    /// The metrics filter selecting only this host, if one was asked for.
+    fn host_filter(&self) -> Option<String> {
+        self.host
+            .as_ref()
+            .map(|host| serde_json::json!({ "host": host }).to_string())
     }
 
     /// Give back what a reading took. SQLite keeps the pages it read, and
@@ -144,7 +164,8 @@ impl Store {
         At {
             store: self,
             start: (at - within).floor() as i64,
-            stop: at.floor() as i64,
+            // Ceil, as `top` does: the same moment reads the same.
+            stop: at.ceil() as i64,
         }
     }
 
@@ -159,7 +180,7 @@ impl Store {
     ) -> Vec<(f64, f64)> {
         let mut filter = serde_json::Map::new();
         filter.insert(key.into(), want.into());
-        self.samples(metric, &Value::Object(filter).to_string(), from, to)
+        self.samples(metric, &self.metrics_filter(filter), from, to)
     }
 
     /// How far apart the store's samples are around a moment, in seconds:
@@ -171,10 +192,10 @@ impl Store {
     /// and started, is a gap and not the spacing.
     pub fn spacing(&self, until: f64) -> (Option<f64>, Option<f64>) {
         let of = |metric: &str, label: Option<(&str, &str)>| -> Option<f64> {
-            let mut filter = match &self.host {
-                Some(host) => serde_json::from_str(host).unwrap_or_default(),
-                None => serde_json::Map::new(),
-            };
+            let mut filter = serde_json::Map::new();
+            if let Some(host) = &self.host {
+                filter.insert("host".into(), (*host).clone().into());
+            }
             if let Some((key, want)) = label {
                 filter.insert(key.into(), want.into());
             }
@@ -233,6 +254,11 @@ impl Store {
         } else {
             3600
         };
+        // The host watched, if one was asked for: a timeline of a day
+        // tells both ends with their day, and no other host's.
+        let mut cpu_filter = serde_json::Map::new();
+        cpu_filter.insert("cpu".into(), "all".into());
+        let cpu_filter = self.metrics_filter(cpu_filter);
         if resolution > 0 {
             let read = || -> Result<Vec<(f64, f64)>> {
                 let mut statement = self.metrics.prepare_cached(
@@ -243,7 +269,7 @@ impl Store {
                     params![
                         METRICS_TABLE,
                         "sys_cpu_busy_pct",
-                        r#"{"cpu":"all"}"#,
+                        cpu_filter,
                         resolution,
                         from.floor() as i64,
                         to.ceil() as i64
@@ -288,15 +314,29 @@ impl Store {
     pub fn incidents(&self, from: f64, to: f64) -> Vec<Incident> {
         let mut incidents = Vec::new();
         for (level, error) in [("error", true), ("warning", false)] {
+            fn ts_of(row: &rusqlite::Row) -> rusqlite::Result<f64> {
+                Ok(row.get::<_, i64>(0)? as f64 / 1e6)
+            }
             let read = || -> Result<Vec<f64>> {
-                let mut statement = self.logs.prepare_cached(&format!(
-                    "SELECT ts FROM {LOGS_TABLE} WHERE ts BETWEEN ?1 AND ?2 AND level = ?3"
-                ))?;
-                let rows = statement.query_map(
-                    params![(from * 1e6) as i64, (to * 1e6) as i64, level],
-                    |row| Ok(row.get::<_, i64>(0)? as f64 / 1e6),
-                )?;
-                Ok(rows.collect::<rusqlite::Result<_>>()?)
+                if let Some(host) = &self.host {
+                    let mut statement = self.logs.prepare_cached(&format!(
+                        "SELECT ts FROM {LOGS_TABLE} WHERE ts BETWEEN ?1 AND ?2 AND level = ?3 AND host = ?4"
+                    ))?;
+                    let rows = statement.query_map(
+                        params![(from * 1e6) as i64, (to * 1e6) as i64, level, host],
+                        ts_of,
+                    )?;
+                    Ok(rows.collect::<rusqlite::Result<_>>()?)
+                } else {
+                    let mut statement = self.logs.prepare_cached(&format!(
+                        "SELECT ts FROM {LOGS_TABLE} WHERE ts BETWEEN ?1 AND ?2 AND level = ?3"
+                    ))?;
+                    let rows = statement.query_map(
+                        params![(from * 1e6) as i64, (to * 1e6) as i64, level],
+                        ts_of,
+                    )?;
+                    Ok(rows.collect::<rusqlite::Result<_>>()?)
+                }
             };
             incidents.extend(
                 read()
@@ -369,11 +409,21 @@ impl Store {
         } else {
             PAGE
         };
-        let mut statement = self.logs.prepare_cached(&format!(
-            "SELECT ts, level, metadata FROM {LOGS_TABLE}
-              WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT ?3"
-        ))?;
-        let mut rows = statement.query(params![from, upto, page as i64])?;
+        let sql = match &self.host {
+            Some(_) => format!(
+                "SELECT ts, level, metadata FROM {LOGS_TABLE}
+                  WHERE ts >= ?1 AND ts <= ?2 AND host = ?4 ORDER BY ts DESC LIMIT ?3"
+            ),
+            None => format!(
+                "SELECT ts, level, metadata FROM {LOGS_TABLE}
+                  WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT ?3"
+            ),
+        };
+        let mut statement = self.logs.prepare_cached(&sql)?;
+        let mut rows = match &self.host {
+            Some(host) => statement.query(params![from, upto, page as i64, host])?,
+            None => statement.query(params![from, upto, page as i64])?,
+        };
         let (mut found, mut read, mut oldest) = (Vec::new(), 0, upto);
         while let Some(row) = rows.next()? {
             read += 1;
@@ -412,12 +462,25 @@ impl Store {
     /// work than a minute.
     pub fn exits_saying(&self, text: &str, from: i64, upto: i64, limit: usize) -> Vec<Exit> {
         let read = || -> Result<Vec<Exit>> {
-            let mut statement = self.logs.prepare_cached(&format!(
-                "SELECT ts, level, metadata FROM {LOGS_TABLE}
-                  WHERE ts >= ?1 AND ts <= ?2 AND message_contains = ?3
-                  ORDER BY ts DESC LIMIT ?4"
-            ))?;
-            let mut rows = statement.query(params![from, upto, text, limit as i64])?;
+            let sql = match &self.host {
+                Some(_) => format!(
+                    "SELECT ts, level, metadata FROM {LOGS_TABLE}
+                      WHERE ts >= ?1 AND ts <= ?2 AND message_contains = ?3 AND host = ?5
+                      ORDER BY ts DESC LIMIT ?4"
+                ),
+                None => format!(
+                    "SELECT ts, level, metadata FROM {LOGS_TABLE}
+                      WHERE ts >= ?1 AND ts <= ?2 AND message_contains = ?3
+                      ORDER BY ts DESC LIMIT ?4"
+                ),
+            };
+            let mut statement = self.logs.prepare_cached(&sql)?;
+            let mut rows = match &self.host {
+                Some(host) => {
+                    statement.query(params![from, upto, text, limit as i64, host])?
+                }
+                None => statement.query(params![from, upto, text, limit as i64])?,
+            };
             let mut exits = Vec::new();
             while let Some(row) = rows.next()? {
                 let record = row.get_ref(2)?.as_str()?;
@@ -433,15 +496,28 @@ impl Store {
     /// name and pid to end after `from`. A pid is given out again in time,
     /// so the first is the one that was running then.
     pub fn record(&self, name: &str, pid: u64, from: f64) -> Option<(f64, Value)> {
-        // By the command's name, which the store keeps an index of.
-        let mut statement = self
-            .logs
-            .prepare_cached(&format!(
+        // By the command's name, which the store keeps an index of. Bounded
+        // so opening a common name (python, bash) does not scan the store.
+        const RECORD_SCAN: i64 = 1000;
+        let sql = match &self.host {
+            Some(_) => format!(
                 "SELECT ts, metadata FROM {LOGS_TABLE}
-                  WHERE service = ?1 AND ts >= ?2 ORDER BY ts"
-            ))
-            .ok()?;
-        let mut rows = statement.query(params![name, (from * 1e6) as i64]).ok()?;
+                  WHERE service = ?1 AND ts >= ?2 AND host = ?3 ORDER BY ts LIMIT ?4"
+            ),
+            None => format!(
+                "SELECT ts, metadata FROM {LOGS_TABLE}
+                  WHERE service = ?1 AND ts >= ?2 ORDER BY ts LIMIT ?3"
+            ),
+        };
+        let mut statement = self.logs.prepare_cached(&sql).ok()?;
+        let mut rows = match &self.host {
+            Some(host) => statement
+                .query(params![name, (from * 1e6) as i64, host, RECORD_SCAN])
+                .ok()?,
+            None => statement
+                .query(params![name, (from * 1e6) as i64, RECORD_SCAN])
+                .ok()?,
+        };
         while let Ok(Some(row)) = rows.next() {
             let at: i64 = row.get(0).ok()?;
             let record: Value = serde_json::from_str(&row.get::<_, String>(1).ok()?).ok()?;
@@ -458,6 +534,10 @@ impl Store {
     /// With something `looked_for`, the jobs that have it in them: in what
     /// any of their processes ran, or as whom, or where. A build is found
     /// by its compiler, and not only by what it was started with.
+    ///
+    /// Figures come from one scan of the reach; no tree is read. A tree is
+    /// read when its job is selected (see `job_tree`): keeping two hundred
+    /// trees to show one peaked at 580 MiB.
     pub fn jobs(&self, reach: Reach, width: usize, looked_for: &str) -> Result<Vec<Job>> {
         let Reach { until, span, limit } = reach;
         let Some(traces) = &self.traces else {
@@ -466,52 +546,109 @@ impl Store {
         let needle = Needle::new(looked_for);
         // The store gives spans in no order that says which are the
         // latest: all of the reach is read once, for which jobs there are,
-        // when each began, and whether it is wanted. Spans are handed over
-        // one at a time, and an hour of them is a third of a second.
+        // their figures, and whether any of them is wanted. Spans are
+        // handed over one at a time, and an hour of them is a third of a
+        // second. What a job said is kept only while something is looked
+        // for; with nothing typed it matches everything anyway.
         struct Seen {
             first: i64,
+            end: i64,
             spans: usize,
+            cpu: f64,
+            failed: usize,
             wanted: bool,
+            /// The earliest span's name, unit, and command, for the summary.
+            earliest: Option<(i64, String, String, Value)>,
+            said: Vec<String>,
         }
         let mut seen: BTreeMap<Vec<u8>, Seen> = BTreeMap::new();
         {
-            let columns = if needle.is_empty() {
-                "trace_id, start_ts"
-            } else {
-                "trace_id, start_ts, name, attributes"
+            // Figures need duration, status, and the attributes (cpu, unit,
+            // command line); the search needs the name and the rest of what
+            // a span said.
+            let columns =
+                "trace_id, start_ts, duration_ns, status, name, service, attributes";
+            // A span's service is host/unit, so one host is a prefix of it.
+            let (sql, prefix) = match &self.host {
+                Some(host) => (
+                    format!(
+                        "SELECT {columns} FROM {TRACES_TABLE} WHERE start_ts BETWEEN ?1 AND ?2 AND service LIKE ?3 ESCAPE '\\'"
+                    ),
+                    Some(format!("{}/%", host.replace(['\\', '%', '_'], ""))),
+                ),
+                None => (
+                    format!(
+                        "SELECT {columns} FROM {TRACES_TABLE} WHERE start_ts BETWEEN ?1 AND ?2"
+                    ),
+                    None,
+                ),
             };
-            let mut statement = traces.prepare_cached(&format!(
-                "SELECT {columns} FROM {TRACES_TABLE} WHERE start_ts BETWEEN ?1 AND ?2"
-            ))?;
-            let mut rows =
-                statement.query(params![((until - span) * 1e9) as i64, (until * 1e9) as i64])?;
+            let mut statement = traces.prepare_cached(&sql)?;
+            let mut rows = match &prefix {
+                Some(prefix) => statement.query(params![
+                    ((until - span) * 1e9) as i64,
+                    (until * 1e9) as i64,
+                    prefix
+                ])?,
+                None => statement.query(params![
+                    ((until - span) * 1e9) as i64,
+                    (until * 1e9) as i64
+                ])?,
+            };
             while let Some(row) = rows.next()? {
+                let trace: Vec<u8> = row.get(0)?;
                 let start: i64 = row.get(1)?;
+                let duration: i64 = row.get(2).unwrap_or(0);
+                let status: String = row.get(3).unwrap_or_default();
+                let name: String = row.get(4).unwrap_or_default();
+                let service: String = row.get(5).unwrap_or_default();
+                let attributes: Value = row
+                    .get_ref(6)
+                    .ok()
+                    .and_then(|v| v.as_str().ok())
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(Value::Null);
                 let wanted = needle.is_empty() || {
-                    let name = row.get_ref(2)?.as_str()?;
-                    let attributes = row.get_ref(3)?.as_str()?;
-                    needle.is_in(name)
-                        || (needle.may_be_in(attributes)
-                            && serde_json::from_str::<Value>(attributes)
-                                .is_ok_and(|attributes| needle.is_in(&said(name, &attributes))))
+                    needle.is_in(&name)
+                        || serde_json::to_string(&attributes)
+                            .is_ok_and(|text| needle.may_be_in(&text))
+                            && needle.is_in(&said(&name, &attributes))
                 };
-                let job = seen.entry(row.get(0)?).or_insert(Seen {
+                let job = seen.entry(trace).or_insert_with(|| Seen {
                     first: start,
+                    end: start + duration,
                     spans: 0,
+                    cpu: 0.0,
+                    failed: 0,
                     wanted: false,
+                    earliest: None,
+                    said: Vec::new(),
                 });
                 job.first = job.first.min(start);
+                job.end = job.end.max(start + duration);
                 job.spans += 1;
+                job.cpu += attributes["process.cpu_seconds"].as_f64().unwrap_or(0.0);
+                job.failed += (status == "error") as usize;
                 job.wanted |= wanted;
+                let earlier = job
+                    .earliest
+                    .as_ref()
+                    .is_none_or(|(at, _, _, _)| start < *at);
+                if earlier {
+                    job.earliest = Some((start, name.clone(), service.clone(), attributes.clone()));
+                }
+                if !needle.is_empty() {
+                    job.said.push(said(&name, &attributes));
+                }
             }
         }
         // One process seen is not yet not a job: the rest of it may have
         // started before the reach. What is looked for is rare enough to
         // read and see; what is not, is left for a reach that has it.
         let mut order: Vec<(i64, Vec<u8>)> = seen
-            .into_iter()
+            .iter()
             .filter(|(_, job)| job.wanted && (job.spans > 1 || !needle.is_empty()))
-            .map(|(trace, job)| (job.first, trace))
+            .map(|(trace, job)| (job.first, trace.clone()))
             .collect();
         order.sort_unstable_by(|a, b| b.cmp(a));
 
@@ -520,38 +657,74 @@ impl Store {
             if jobs.len() == limit {
                 break;
             }
-            let all = nodes(traces, &trace)?;
-            let Some(first) = all.first().filter(|_| all.len() > 1) else {
+            let Some(job) = seen.remove(&trace) else {
                 continue;
             };
-            let start = all.iter().map(|n| n.start_ns).min().unwrap_or(0);
-            let end = all
-                .iter()
-                .map(|n| n.start_ns + n.duration_ns)
-                .max()
-                .unwrap_or(start);
+            // A trace of one process is not a job: the rest of it may have
+            // started before the reach, or it is a worker of a daemon.
+            if job.spans < 2 {
+                continue;
+            }
+            let (name, service, attributes) = match job.earliest {
+                Some((_, name, service, attributes)) => (name, service, attributes),
+                None => continue,
+            };
+            let unit = attributes["process.unit"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| service.rsplit('/').next().unwrap_or("-").to_string());
             jobs.push(Job {
-                started: start as f64 / 1e9,
-                duration: (end - start) as f64 / 1e9,
-                cpu: all
-                    .iter()
-                    .filter_map(|n| n.attributes["process.cpu_seconds"].as_f64())
-                    .sum(),
-                processes: all.len(),
-                failed: all.iter().filter(|n| n.failed).count(),
-                unit: first.unit.clone(),
-                command: first.command(width),
-                tree: tree(&all, 200, width),
-                said: all
-                    .iter()
-                    .map(|n| said(&n.name, &n.attributes))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+                started: job.first as f64 / 1e9,
+                duration: (job.end - job.first).max(0) as f64 / 1e9,
+                cpu: job.cpu,
+                processes: job.spans,
+                failed: job.failed,
+                unit,
+                command: job_command(&name, &attributes, width),
+                tree: Vec::new(),
+                said: job.said.join("\n"),
                 running: false,
+                trace,
             });
         }
         Ok(jobs)
     }
+
+    /// The tree of one job, and what its processes said, for the selected
+    /// row. Read when it is selected, and not with the list: two hundred
+    /// trees to show one.
+    pub fn job_tree(&self, trace: &[u8], width: usize) -> Result<(Vec<String>, String)> {
+        let Some(traces) = &self.traces else {
+            return Ok((Vec::new(), String::new()));
+        };
+        let all = nodes(traces, trace)?;
+        let said = all
+            .iter()
+            .map(|n| said(&n.name, &n.attributes))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok((tree(&all, 200, width), said))
+    }
+}
+
+/// What the summary of a job names it: what its first process ran, in at
+/// most `width` characters; and what it ran before that, if it was started
+/// as something else. As `Node::command` spells it.
+fn job_command(name: &str, attributes: &Value, width: usize) -> String {
+    let text = |key: &str| attributes[key].as_str().filter(|text| !text.is_empty());
+    let now = shorten(text("process.command_line").unwrap_or(name), width);
+    match text("process.started_as") {
+        Some(first) => format!("{} → {now}", shorten(first, width)),
+        None => now,
+    }
+}
+
+fn shorten(text: &str, width: usize) -> String {
+    if width == 0 || text.chars().count() <= width {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 /// What can be looked for in a process of a job: what it ran, what it was
@@ -673,7 +846,7 @@ impl Source for At<'_> {
                 params![
                     METRICS_TABLE,
                     metric,
-                    self.store.host,
+                    self.store.host_filter(),
                     self.start,
                     self.stop
                 ],
@@ -1043,8 +1216,11 @@ mod tests {
         assert_eq!(make.cpu, 1.0);
         assert_eq!(make.failed, 1);
         assert_eq!(make.unit, "build.service");
+        // The list carries figures; the tree is read for the selected row.
+        assert!(make.tree.is_empty());
+        let (tree, _) = store.job_tree(&make.trace, 72).unwrap();
         assert_eq!(
-            make.tree,
+            tree,
             [
                 "make -x  2.0s, cpu 500ms",
                 "└─ cc -x  2.0s, cpu 500ms  [exited 1]"

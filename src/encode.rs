@@ -46,6 +46,7 @@ fn push_escaped(out: &mut String, value: &str) {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
             _ => out.push(ch),
         }
     }
@@ -115,14 +116,19 @@ fn key_values(object: &Map<String, Value>) -> Value {
 /// An OTLP export request, as JSON: the spans, under the resource each
 /// belongs to.
 pub fn otlp_json(host: &str, spans: &[Span]) -> String {
-    let mut units: Vec<&str> = spans.iter().map(|span| span.unit.as_str()).collect();
+    use std::collections::HashMap;
+    // Group once: per-unit filtering over all spans is quadratic.
+    let mut by_unit: HashMap<&str, Vec<&Span>> = HashMap::new();
+    for span in spans {
+        by_unit.entry(span.unit.as_str()).or_default().push(span);
+    }
+    let mut units: Vec<&str> = by_unit.keys().copied().collect();
     units.sort_unstable();
-    units.dedup();
 
     let resource_spans: Vec<Value> = units
         .into_iter()
         .map(|unit| {
-            let of_unit: Vec<&Span> = spans.iter().filter(|span| span.unit == unit).collect();
+            let of_unit = &by_unit[unit];
             let encoded: Vec<Value> = of_unit
                 .iter()
                 .map(|span| {

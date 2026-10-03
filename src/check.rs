@@ -162,19 +162,19 @@ pub fn run(args: &CheckArgs) {
     #[cfg(feature = "http")]
     {
         println!();
-        plane("metrics plane", &args.metrics_url);
-        plane("logs plane", &args.logs_url);
-        plane("traces plane", &args.traces_url);
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(2))
+            .build();
+        plane(&agent, "metrics plane", &args.metrics_url);
+        plane(&agent, "logs plane", &args.logs_url);
+        plane(&agent, "traces plane", &args.traces_url);
     }
     #[cfg(not(feature = "http"))]
     let _ = args;
 }
 
 #[cfg(feature = "http")]
-fn plane(what: &str, url: &str) {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(3))
-        .build();
+fn plane(agent: &ureq::Agent, what: &str, url: &str) {
     let base = url.trim_end_matches('/');
     let state = match agent.get(&format!("{base}/live")).call() {
         Ok(_) => {

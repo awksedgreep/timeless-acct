@@ -137,11 +137,10 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &State, snapshot: &Snapshot
     // A stretch within a day is told by the time; one of a day or longer
     // needs the day as well, or both ends of a day read the same.
     let tell = |at: f64| -> String {
-        let text = clock::format(at);
         if to - from >= 86_400.0 {
-            text[5..16].to_string()
+            clock::day_time(at)
         } else {
-            text[11..16].to_string()
+            clock::time(at)[..5].to_string()
         }
     };
     let mut block = Block::bordered()
@@ -363,7 +362,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &State, detail: &Detail) {
     }
     if let (Tab::Exits, Some(reached)) = (state.tab, detail.looking) {
         spans.push(Span::styled(
-            format!("   read back to {} …", &clock::format(reached)[11..]),
+            format!("   read back to {} …", clock::time(reached)),
             DIM,
         ));
     }
@@ -594,7 +593,7 @@ fn draw_jobs(frame: &mut Frame, area: Rect, state: &mut State, detail: &Detail) 
                 right(human_duration(job.duration), Style::new())
             };
             Row::new(vec![
-                Cell::from(clock::format(job.started)[11..].to_string()),
+                Cell::from(clock::time(job.started)),
                 right(job.processes.to_string(), Style::new()),
                 failed,
                 took,
@@ -631,7 +630,12 @@ fn draw_jobs(frame: &mut Frame, area: Rect, state: &mut State, detail: &Detail) 
             .tree
             .iter()
             .map(|line| {
-                if line.contains("  [") {
+                // As tree() spells a failed process: "  [exited 1]".
+                // A bare "  [" would also redden a command that runs one.
+                if line.contains("  [exited ")
+                    || line.contains("  [killed ")
+                    || line.ends_with("  [error]")
+                {
                     Line::styled(line.clone(), BAD)
                 } else {
                     Line::raw(line.clone())
@@ -670,7 +674,7 @@ fn draw_exits(frame: &mut Frame, area: Rect, state: &mut State, detail: &Detail)
                 _ => Style::new(),
             };
             Row::new(vec![
-                Cell::from(clock::format(exit.at)[11..].to_string()),
+                Cell::from(clock::time(exit.at)),
                 right(exit.pid.to_string(), DIM),
                 Cell::from(Span::styled(exit.status.clone(), style)),
                 right(human_duration(exit.elapsed), Style::new()),
@@ -850,6 +854,9 @@ fn draw_help(frame: &mut Frame) {
 /// A text in lines of at most `width` characters, broken between words
 /// where there is a between, and within one where there is not.
 pub fn fold(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
     let mut lines = Vec::new();
     let mut line = String::new();
     let mut length = 0;
@@ -1067,6 +1074,7 @@ mod tests {
             command: "make all".into(),
             said: "make all\ncc -c a.c".into(),
             running: false,
+            trace: vec![1; 16],
             tree: vec![
                 "make all  2.5s, cpu 500ms".into(),
                 "└─ cc -c a.c  1.0s, cpu 500ms  [exited 1]".into(),
