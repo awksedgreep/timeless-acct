@@ -476,9 +476,7 @@ impl Store {
             };
             let mut statement = self.logs.prepare_cached(&sql)?;
             let mut rows = match &self.host {
-                Some(host) => {
-                    statement.query(params![from, upto, text, limit as i64, host])?
-                }
+                Some(host) => statement.query(params![from, upto, text, limit as i64, host])?,
                 None => statement.query(params![from, upto, text, limit as i64])?,
             };
             let mut exits = Vec::new();
@@ -566,8 +564,7 @@ impl Store {
             // Figures need duration, status, and the attributes (cpu, unit,
             // command line); the search needs the name and the rest of what
             // a span said.
-            let columns =
-                "trace_id, start_ts, duration_ns, status, name, service, attributes";
+            let columns = "trace_id, start_ts, duration_ns, status, name, service, attributes";
             // A span's service is host/unit, so one host is a prefix of it.
             let (sql, prefix) = match &self.host {
                 Some(host) => (
@@ -590,10 +587,9 @@ impl Store {
                     (until * 1e9) as i64,
                     prefix
                 ])?,
-                None => statement.query(params![
-                    ((until - span) * 1e9) as i64,
-                    (until * 1e9) as i64
-                ])?,
+                None => {
+                    statement.query(params![((until - span) * 1e9) as i64, (until * 1e9) as i64])?
+                }
             };
             while let Some(row) = rows.next()? {
                 let trace: Vec<u8> = row.get(0)?;

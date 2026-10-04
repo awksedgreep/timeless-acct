@@ -1,5 +1,19 @@
 # Changes
 
+## 0.2.3
+
+- The store engine is timeless-libsql 0.8.9 (from 0.8.6). Compaction
+  sweeps end, are planned once, and merge small chunks: on the live
+  workstation store raw samples went from 399 to 1,527 points a chunk and
+  from 0.38 to 0.18 bytes a sample, and the collector's memory from about
+  325 to 215 MiB. Reads of a few series among many seek past the rest of
+  the chunk index.
+
+- The store-limit test follows the merged chunks: the eight hours of
+  samples that can go are now under a twentieth of its store.
+
+- `cargo fmt` and `cargo clippy` are clean again.
+
 ## 0.2.2
 
 - What each tick costs on the wire is counted, so a store can show wire

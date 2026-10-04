@@ -394,9 +394,7 @@ impl ProcessCollector {
 
             let tracked = self.tracked.get_mut(&pid).expect("checked above");
             let switches = match status.as_ref() {
-                Some(status) => {
-                    status.voluntary_switches + status.involuntary_switches
-                }
+                Some(status) => status.voluntary_switches + status.involuntary_switches,
                 // Unreadable: carry the last count forward so the rate is
                 // zero rather than a spike or a reset.
                 None => tracked.last.switches,
@@ -669,13 +667,15 @@ impl ProcessCollector {
         if self.group_labels.len() > 4096 {
             let present: std::collections::HashSet<&str> =
                 groups.keys().map(String::as_str).collect();
-            self.group_labels.retain(|name, _| present.contains(name.as_str()));
+            self.group_labels
+                .retain(|name, _| present.contains(name.as_str()));
             settle(&mut self.group_labels);
         }
         if self.user_labels.len() > 1024 {
             let present: std::collections::HashSet<&str> =
                 users.keys().map(String::as_str).collect();
-            self.user_labels.retain(|name, _| present.contains(name.as_str()));
+            self.user_labels
+                .retain(|name, _| present.contains(name.as_str()));
             settle(&mut self.user_labels);
         }
         let mut groups: Vec<(String, Total)> = groups.into_iter().collect();

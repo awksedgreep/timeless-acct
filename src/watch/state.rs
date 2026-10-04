@@ -389,7 +389,10 @@ impl State {
     }
 
     fn matches(filter: &str, texts: &[&str]) -> bool {
-        filter.is_empty() || texts.iter().any(|text| text.to_lowercase().contains(filter))
+        filter.is_empty()
+            || texts
+                .iter()
+                .any(|text| text.to_lowercase().contains(filter))
     }
 
     /// The units to show, in the order to show them.

@@ -31,10 +31,7 @@ impl std::fmt::Debug for HttpOptions {
             .field("metrics_url", &self.metrics_url)
             .field("logs_url", &self.logs_url)
             .field("traces_url", &self.traces_url)
-            .field(
-                "token",
-                &self.token.as_ref().map(|_| "***"),
-            )
+            .field("token", &self.token.as_ref().map(|_| "***"))
             .field("timeout", &self.timeout)
             .field("backlog", &self.backlog)
             .finish()

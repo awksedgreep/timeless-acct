@@ -946,8 +946,10 @@ mod tests {
         let (pruned, fits) = sink.fit().unwrap();
         assert!(pruned.is_empty() && fits);
 
-        // A little over: the oldest samples go, and nothing else.
-        sink.limit = Some(full * 9 / 10);
+        // A little over: the oldest samples go, and nothing else. Little,
+        // because compaction merges a series' hours into one chunk, and
+        // the eight hours that can go are under a twentieth of the store.
+        sink.limit = Some(full * 98 / 100);
         let (pruned, fits) = sink.fit().unwrap();
         assert!(fits);
         assert!(!pruned.is_empty());
@@ -955,7 +957,7 @@ mod tests {
         assert!(hour(&sink, Kind::Samples).0 > 0);
         assert_eq!(hour(&sink, Kind::Records), (0, 9));
         assert_eq!(hour(&sink, Kind::Spans), (0, 9));
-        assert!(sink.bytes().unwrap() <= full * 9 / 10);
+        assert!(sink.bytes().unwrap() <= full * 98 / 100);
 
         // Far over: samples down to their last hour, then spans, then
         // records, and the last hour of each is kept whatever the limit.
@@ -983,12 +985,12 @@ mod tests {
         for kind in &seen {
             assert!(expected.any(|k| k == kind), "{order:?}");
         }
+        // Samples may have nothing left to give: what could go went above.
         assert!(
-            seen.len() >= 3
-                && seen.first() == Some(&Kind::Samples)
-                && seen.last() == Some(&Kind::Records),
+            seen.len() >= 3 && seen.last() == Some(&Kind::Records),
             "{order:?}"
         );
+        assert_eq!(hour(&sink, Kind::Samples).0, 8);
         // The last hour, and the chunk that reaches it: pruning is
         // chunk-granular, and a chunk here is an hour.
         for kind in Kind::FILES {
@@ -998,9 +1000,10 @@ mod tests {
         }
         // Two hours of ten of samples, spans, and records; the rollups,
         // whose merged chunks reach into the last hours and stay whole;
-        // and the series, which are kept until the engine lets them go.
+        // the series, which are kept until the engine lets them go; and
+        // pages the deletes left part full, which vacuum does not take.
         let left = sink.bytes().unwrap();
-        assert!(left < full / 2, "{left} of {full}");
+        assert!(left < full * 2 / 3, "{left} of {full}");
         let (first, last) = sink.range(Kind::Rollups(300)).unwrap().unwrap();
         assert!(
             last - first < 9 * 3600,

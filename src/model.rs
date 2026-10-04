@@ -71,7 +71,11 @@ pub fn measured(value: f64) -> f64 {
         (value * 1000.0).round() / 1000.0
     };
     // Rounding can produce negative zero, which renders as "-0".
-    if rounded == 0.0 { 0.0 } else { rounded }
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

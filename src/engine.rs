@@ -118,11 +118,11 @@ impl Sources<'_> {
         if let Some(exec) = self.described.get(&pid) {
             return Some(seen_exec(exec));
         }
-        if let Some(seen) = self
-            .ending
-            .get(&pid)
-            .and_then(|candidates| candidates.iter().max_by(|a, b| a.start_epoch.total_cmp(&b.start_epoch)))
-        {
+        if let Some(seen) = self.ending.get(&pid).and_then(|candidates| {
+            candidates
+                .iter()
+                .max_by(|a, b| a.start_epoch.total_cmp(&b.start_epoch))
+        }) {
             return Some(*seen);
         }
         let mut buf = String::new();
@@ -392,10 +392,7 @@ impl Engine {
             self.written[0] += prometheus_text(host, &batch).len() as u64;
             self.written[1] += ndjson(host, &events).len() as u64;
             self.written[2] += otlp_json(host, &spans).len() as u64;
-            for (plane, total) in ["metrics", "logs", "traces"]
-                .into_iter()
-                .zip(self.written)
-            {
+            for (plane, total) in ["metrics", "logs", "traces"].into_iter().zip(self.written) {
                 batch.push(
                     "acct_written_bytes_total",
                     &labels(vec![("plane", plane.into())]),
@@ -557,16 +554,12 @@ impl Engine {
 
             // Known from sampling: either still tracked, or found gone by
             // the last sweep and waiting here for this record.
-            let tracked = match waiting_by_pid.get_mut(&exit.pid) {
-                Some(candidates) => match candidates
+            let tracked = waiting_by_pid.get_mut(&exit.pid).and_then(|candidates| {
+                candidates
                     .iter()
                     .position(|t| same(t.start_epoch))
-                {
-                    Some(index) => Some(candidates.swap_remove(index)),
-                    None => None,
-                },
-                None => None,
-            };
+                    .map(|index| candidates.swap_remove(index))
+            });
             let tracked = match tracked {
                 Some(tracked) => Some(tracked),
                 None => self.parts.processes.as_mut().and_then(|collector| {
