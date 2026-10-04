@@ -81,8 +81,24 @@ fn table_argument(name: &str, value: &str) -> Result<String> {
     Ok(format!("{name}='{value}'"))
 }
 
+/// How private a store's files are: as private as its directory. Its
+/// owner's always; its group's to read when the directory lets the group
+/// in, as a service's does for the users who watch it; never anyone else's.
+fn privacy(dir: &Path) -> Result<u32> {
+    let mode = fs::metadata(dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .permissions()
+        .mode();
+    Ok(0o600 | (mode & 0o040))
+}
+
+/// Give a file the store's privacy, whatever the umask said when it was made.
+fn keep(path: &Path, mode: u32) {
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+}
+
 /// An exclusive advisory lock, held for as long as the file is open.
-fn lease(database: &Path) -> Result<File> {
+fn lease(database: &Path, mode: u32) -> Result<File> {
     let mut name = database.as_os_str().to_owned();
     name.push(LEASE_SUFFIX);
     let path = PathBuf::from(name);
@@ -93,8 +109,7 @@ fn lease(database: &Path) -> Result<File> {
         .write(true)
         .open(&path)
         .with_context(|| format!("open owner lease {}", path.display()))?;
-    // The lease sits beside a store of command lines: owner-only like it.
-    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    keep(&path, mode);
     // SAFETY: flock takes a descriptor this function owns.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
@@ -106,12 +121,27 @@ fn lease(database: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Whether a collector or a server holds this database now. A reader asks
+/// with a shared lock, which a read-only descriptor may take and which
+/// fails only while the owner's exclusive one is held.
+pub fn is_owned(database: &Path) -> bool {
+    let mut name = database.as_os_str().to_owned();
+    name.push(LEASE_SUFFIX);
+    let Ok(file) = File::open(PathBuf::from(name)) else {
+        // No lease file: nothing has ever owned it, or it was copied.
+        return false;
+    };
+    // SAFETY: flock takes a descriptor this function owns; dropping the
+    // file releases the lock.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    rc != 0
+}
+
 /// Open one database the way the signal servers do, and make the engine's
 /// tables available on the connection.
-pub fn open(path: &Path) -> Result<Connection> {
+pub fn open(path: &Path, mode: u32) -> Result<Connection> {
     let connection = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-    // A store holds command lines: owner-only, whatever the umask says.
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    keep(path, mode);
     // auto_vacuum comes first: it can only be chosen while the database is
     // empty, and switching to WAL writes the header that ends that. The
     // page size is the traces server's, for the same reason and at the
@@ -128,6 +158,13 @@ pub fn open(path: &Path) -> Result<Connection> {
          PRAGMA temp_store = MEMORY;
          PRAGMA busy_timeout = 5000;"
     ))?;
+    // SQLite makes the log and its index as private as the database, but
+    // a store whose directory has changed keeps the ones it had.
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        keep(Path::new(&name), mode);
+    }
     timeless_ext::register_telemetry(&connection)
         .map_err(|error| anyhow!("register the timeless engine: {error}"))?;
 
@@ -223,23 +260,25 @@ const KEPT_WHATEVER: i64 = 3600;
 
 impl EmbeddedSink {
     pub fn open(options: &EmbeddedOptions) -> Result<Self> {
-        // A store holds what every process on the host was run with. It
-        // is its owner's to read, and no one else's.
+        // A store holds what every process on the host was run with. A new
+        // one is its owner's to read, and no one else's; a directory made
+        // for it, as a service's is, says who else may.
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&options.dir)
             .with_context(|| format!("create {}", options.dir.display()))?;
+        let mode = privacy(&options.dir)?;
         let metrics_path = options.dir.join(METRICS_DB);
         let logs_path = options.dir.join(LOGS_DB);
         let traces_path = options.dir.join(TRACES_DB);
         let leases = [
-            lease(&metrics_path)?,
-            lease(&logs_path)?,
-            lease(&traces_path)?,
+            lease(&metrics_path, mode)?,
+            lease(&logs_path, mode)?,
+            lease(&traces_path, mode)?,
         ];
 
-        let metrics = open(&metrics_path)?;
+        let metrics = open(&metrics_path, mode)?;
         let mut arguments = vec![table_argument("retention", &options.retention)?];
         if !options.rollups.is_empty() {
             arguments.push(table_argument("rollups", &options.rollups)?);
@@ -252,14 +291,14 @@ impl EmbeddedSink {
             arguments.join(", ")
         ))?;
 
-        let logs = open(&logs_path)?;
+        let logs = open(&logs_path, mode)?;
         logs.execute_batch(&format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS {LOGS_TABLE}
              USING timeless_logs(index_keys='{LOG_INDEX_KEYS}', timestamp_unit='us', {});",
             table_argument("retention", &options.log_retention)?
         ))?;
 
-        let traces = open(&traces_path)?;
+        let traces = open(&traces_path, mode)?;
         traces.execute_batch(&format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS {TRACES_TABLE}
              USING timeless_traces({});",
@@ -1092,6 +1131,26 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "{db}");
+        }
+    }
+
+    #[test]
+    fn a_store_in_a_directory_its_group_may_read_is_the_groups_to_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new("embedded_group");
+        let options = options(&fixture);
+        fs::DirBuilder::new()
+            .mode(0o750)
+            .create(&options.dir)
+            .unwrap();
+        // Whatever the umask; as a service's state directory is made.
+        fs::set_permissions(&options.dir, fs::Permissions::from_mode(0o750)).unwrap();
+        let mut sink = EmbeddedSink::open(&options).unwrap();
+        sink.flush().unwrap();
+        for entry in fs::read_dir(&options.dir).unwrap() {
+            let entry = entry.unwrap();
+            let mode = entry.metadata().unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o640, "{:?}", entry.file_name());
         }
     }
 

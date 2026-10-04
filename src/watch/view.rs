@@ -144,7 +144,10 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &State, snapshot: &Snapshot
         }
     };
     let mut block = Block::bordered()
-        .title(Span::styled(" timeless-acct ", HEAD))
+        .title(Line::from(vec![
+            Span::styled(" timeless-acct ", HEAD),
+            Span::styled(concat!(env!("CARGO_PKG_VERSION"), " "), DIM),
+        ]))
         .title(when.right_aligned());
     if to > from {
         block = block

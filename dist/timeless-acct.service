@@ -1,9 +1,8 @@
-# timeless-acct as a system service.
+# timeless-acct as a system service, keeping a store of its own in
+# /var/lib/timeless-acct. dist/install.sh puts it in place:
 #
-#   sudo install -m 0755 target/release/timeless-acct /usr/local/bin/
-#   sudo install -m 0644 dist/timeless-acct.service /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now timeless-acct
+#   cargo build --release
+#   sudo dist/install.sh
 #
 # It runs as an unprivileged user that holds exactly three capabilities, and
 # `timeless-acct check` says what each one buys:
@@ -22,21 +21,25 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# To the Timeless planes, which is what the canvas reads.
-ExecStart=/usr/local/bin/timeless-acct run --sink http
-# Or to a store of its own, under /var/lib/timeless-acct:
-#ExecStart=/usr/local/bin/timeless-acct run --sink embedded --data-dir %S/timeless-acct
+# The host's store, which `timeless-acct watch` reads when its user has
+# none of their own.
+ExecStart=/usr/local/bin/timeless-acct run --data-dir /var/lib/timeless-acct
 
+# Or to the Timeless planes, which is what the canvas reads:
+#ExecStart=/usr/local/bin/timeless-acct run --sink http
 #Environment=TIMELESS_ACCT_METRICS_URL=http://127.0.0.1:8428
 #Environment=TIMELESS_ACCT_LOGS_URL=http://127.0.0.1:9428
 #Environment=TIMELESS_ACCT_TRACES_URL=http://127.0.0.1:10428
 # A bearer token, for planes that require one: TIMELESS_ACCT_TOKEN=...
 #EnvironmentFile=-/etc/timeless-acct.env
 
-DynamicUser=yes
+# A user of its own, from dist/timeless-acct.sysusers. Its group's members
+# may read the store: it holds what every process on the host was run
+# with, so the group is for those who may see that.
+User=timeless-acct
+Group=timeless-acct
 StateDirectory=timeless-acct
-# A store holds what every process on the host was run with.
-StateDirectoryMode=0700
+StateDirectoryMode=0750
 AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 NoNewPrivileges=yes

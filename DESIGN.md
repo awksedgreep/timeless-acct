@@ -671,6 +671,35 @@ yet".
 a database is empty, and switching to WAL writes the header that ends that.
 The collector sets it first. Set second, it is silently ignored.
 
+### Where it is, and who may read it
+
+A store is in one of two standard places: the host's,
+`/var/lib/timeless-acct`, which the service and root write, and a user's
+own, under `$XDG_DATA_HOME`. A collector writes the one that fits who runs
+it; a reader reads its user's own if there is one, and the host's
+otherwise. So the first five minutes are install, `watch`, and stop, with
+nothing to say about where, and the one path that cannot be guessed,
+`--data-dir`, is for the cases that are not those.
+
+The old default was a directory relative to wherever a command was run.
+`run` started in one directory and `watch` in another used two stores,
+and nothing said so.
+
+A store holds the command line of every process on the host, so it is
+never anyone's but its owner's and, when its directory lets the group in,
+its group's: the collector gives each file it makes `0600`, and `0640` in
+a directory that is group-readable. The service's is: it runs as a
+`timeless-acct` user of its own, not `DynamicUser=`, whose state lives
+under `/var/lib/private` where only root can reach it, and the members of
+the `timeless-acct` group are those who may watch. A reader needs nothing
+more than read access. While the collector runs, SQLite reads the
+database through the collector's own index of its log. When it has
+stopped, the index is gone, and a reader that may not write beside the
+database cannot make it again; then, if no collector holds the store's
+lease, the reader opens the database as immutable, which needs no index.
+Nothing is writing it, and a collector that stopped cleanly folded its
+log into it first.
+
 ## Watching
 
 The viewer is what the canvas is for, in the place a collector already is:

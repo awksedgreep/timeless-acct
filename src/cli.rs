@@ -143,15 +143,11 @@ pub struct RunArgs {
     #[arg(long, default_value = "1h", value_name = "SPAN")]
     pub trace_max_age: String,
 
-    /// Local store: its directory
+    /// Local store: its directory. Unless told, the user's own
+    /// (~/.local/share/timeless-acct), or for root /var/lib/timeless-acct
     #[cfg(feature = "embedded")]
-    #[arg(
-        long,
-        env = "TIMELESS_ACCT_DATA",
-        default_value = "timeless-acct-data",
-        value_name = "DIR"
-    )]
-    pub data_dir: PathBuf,
+    #[arg(long, env = "TIMELESS_ACCT_DATA", value_name = "DIR")]
+    pub data_dir: Option<PathBuf>,
 
     /// Local store: how long samples are kept. Applies when the store is created
     #[cfg(feature = "embedded")]
@@ -290,14 +286,10 @@ pub enum TopSort {
 #[cfg(feature = "embedded")]
 #[derive(Args)]
 pub struct TopArgs {
-    /// The store's directory
-    #[arg(
-        long,
-        env = "TIMELESS_ACCT_DATA",
-        default_value = "timeless-acct-data",
-        value_name = "DIR"
-    )]
-    pub data_dir: PathBuf,
+    /// The store's directory. Unless told, the user's own if there is
+    /// one, or the host's (/var/lib/timeless-acct)
+    #[arg(long, env = "TIMELESS_ACCT_DATA", value_name = "DIR")]
+    pub data_dir: Option<PathBuf>,
 
     /// The moment to look at: now, -15m, 14:30, "2026-09-29 14:30"
     #[arg(
@@ -328,14 +320,10 @@ pub struct TopArgs {
 #[cfg(feature = "embedded")]
 #[derive(Args)]
 pub struct ExitsArgs {
-    /// The store's directory
-    #[arg(
-        long,
-        env = "TIMELESS_ACCT_DATA",
-        default_value = "timeless-acct-data",
-        value_name = "DIR"
-    )]
-    pub data_dir: PathBuf,
+    /// The store's directory. Unless told, the user's own if there is
+    /// one, or the host's (/var/lib/timeless-acct)
+    #[arg(long, env = "TIMELESS_ACCT_DATA", value_name = "DIR")]
+    pub data_dir: Option<PathBuf>,
 
     /// The earliest moment
     #[arg(
@@ -391,14 +379,10 @@ pub struct ExitsArgs {
 #[cfg(feature = "embedded")]
 #[derive(Args)]
 pub struct TreesArgs {
-    /// The store's directory
-    #[arg(
-        long,
-        env = "TIMELESS_ACCT_DATA",
-        default_value = "timeless-acct-data",
-        value_name = "DIR"
-    )]
-    pub data_dir: PathBuf,
+    /// The store's directory. Unless told, the user's own if there is
+    /// one, or the host's (/var/lib/timeless-acct)
+    #[arg(long, env = "TIMELESS_ACCT_DATA", value_name = "DIR")]
+    pub data_dir: Option<PathBuf>,
 
     /// The earliest moment a process of the job started
     #[arg(
@@ -463,14 +447,10 @@ pub enum WatchView {
 #[cfg(feature = "watch")]
 #[derive(Args)]
 pub struct WatchArgs {
-    /// The store's directory
-    #[arg(
-        long,
-        env = "TIMELESS_ACCT_DATA",
-        default_value = "timeless-acct-data",
-        value_name = "DIR"
-    )]
-    pub data_dir: PathBuf,
+    /// The store's directory. Unless told, the user's own if there is
+    /// one, or the host's (/var/lib/timeless-acct)
+    #[arg(long, env = "TIMELESS_ACCT_DATA", value_name = "DIR")]
+    pub data_dir: Option<PathBuf>,
 
     /// The moment to start at: now, -15m, 14:30, "2026-09-29 14:30"
     #[arg(

@@ -144,7 +144,10 @@ struct Hunt {
 
 impl Watch {
     fn new(args: &WatchArgs) -> Result<Self> {
-        let store = Store::open(&args.data_dir, args.host.as_deref())?;
+        let store = Store::open(
+            &crate::place::to_read(args.data_dir.clone())?,
+            args.host.as_deref(),
+        )?;
         let now = epoch_now();
         let at = match args.at.as_str() {
             "now" => None,

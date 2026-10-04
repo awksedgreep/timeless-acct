@@ -16,29 +16,67 @@ use crate::accounting::{human_bytes, human_duration};
 use crate::cli::{ExitsArgs, SummaryBy, TopArgs, TopSort, TreesArgs};
 use crate::clock;
 use crate::lineage::hex;
+use crate::place;
 use crate::sink::embedded::{
-    LOGS_DB, LOGS_TABLE, METRICS_DB, METRICS_TABLE, TRACES_DB, TRACES_TABLE,
+    self, LOGS_DB, LOGS_TABLE, METRICS_DB, METRICS_TABLE, TRACES_DB, TRACES_TABLE,
 };
 use crate::taskstats::epoch_now;
 
 pub(crate) fn open(dir: &Path, name: &str) -> Result<Connection> {
     let path = dir.join(name);
-    if !path.exists() {
-        bail!(
+    match path.try_exists() {
+        Ok(true) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => bail!(
+            "{} is not this user's to read: a store is its owner's, and its \
+             group's when its directory lets the group in",
+            dir.display()
+        ),
+        _ => bail!(
             "{} does not exist: is {} a store's directory?",
             path.display(),
             dir.display()
-        );
+        ),
     }
     // Without the owner lease: a reader takes nothing from the collector.
-    let connection = Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("open {}", path.display()))?;
-    connection.execute_batch("PRAGMA busy_timeout = 5000;")?;
+    let connection = match read_only(&path, false) {
+        Ok(connection) => connection,
+        // A WAL database is read through an index of its log, which SQLite
+        // makes beside it and removes when the last writer closes. A reader
+        // that may not write in the directory, a member of the store's group
+        // or a read-only mount, cannot make it again; with no one writing,
+        // the database is all there is, and may be read as it stands.
+        Err(error) if !embedded::is_owned(&path) => read_only(&path, true).map_err(|_| error)?,
+        Err(error) => return Err(error),
+    };
     timeless_ext::register_telemetry(&connection)
         .map_err(|error| anyhow::anyhow!("register the timeless engine: {error}"))?;
+    Ok(connection)
+}
+
+/// Open a database for reading, and read from it: SQLite opens lazily,
+/// and only a read says whether it can be read.
+fn read_only(path: &Path, immutable: bool) -> Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let connection = if immutable {
+        let escaped = path
+            .to_string_lossy()
+            .replace('%', "%25")
+            .replace('?', "%3f")
+            .replace('#', "%23");
+        Connection::open_with_flags(
+            format!("file:{escaped}?immutable=1"),
+            flags | OpenFlags::SQLITE_OPEN_URI,
+        )
+    } else {
+        Connection::open_with_flags(path, flags)
+    }
+    .with_context(|| format!("open {}", path.display()))?;
+    connection.execute_batch("PRAGMA busy_timeout = 5000;")?;
+    connection
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .with_context(|| format!("read {}", path.display()))?;
     Ok(connection)
 }
 
@@ -98,7 +136,7 @@ pub fn top(args: &TopArgs) -> Result<()> {
     let within = clock::parse_span(&args.within)?;
     let (start, stop) = ((at - within).floor() as i64, at.ceil() as i64);
     let host = args.host.as_deref();
-    let connection = open(&args.data_dir, METRICS_DB)?;
+    let connection = open(&place::to_read(args.data_dir.clone())?, METRICS_DB)?;
 
     let cpu = latest(&connection, "proc_cpu_pct", "proc", host, start, stop)?;
     if cpu.is_empty() {
@@ -194,7 +232,7 @@ pub fn exits(args: &ExitsArgs) -> Result<()> {
     if until < since {
         bail!("--until is before --since");
     }
-    let connection = open(&args.data_dir, LOGS_DB)?;
+    let connection = open(&place::to_read(args.data_dir.clone())?, LOGS_DB)?;
 
     // The indexed keys are hidden columns of the table; each of these is an
     // index lookup.
@@ -508,7 +546,7 @@ pub fn trees(args: &TreesArgs) -> Result<()> {
     if until < since {
         bail!("--until is before --since");
     }
-    let connection = open(&args.data_dir, TRACES_DB)?;
+    let connection = open(&place::to_read(args.data_dir.clone())?, TRACES_DB)?;
 
     // The jobs with a process that started in the window and is what was
     // asked for. Each of these is pushed down into the store. Grouped and
@@ -601,6 +639,47 @@ pub fn trees(args: &TreesArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_store_is_read_where_the_reader_may_not_write() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root may write anywhere, and never meets this
+        }
+        let fixture = crate::testutil::Fixture::new("query_stopped");
+        let dir = fixture.path("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A WAL database whose writer has closed, as a stopped collector's
+        // is. Plain SQLite: the engine keeps what it opens open for the
+        // life of the process, and SQLite shares a log's index among the
+        // connections of one process, which would hide what this tests.
+        {
+            let writer = Connection::open(dir.join(METRICS_DB)).unwrap();
+            writer
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     CREATE TABLE kept (n INTEGER);
+                     INSERT INTO kept VALUES (1), (2);",
+                )
+                .unwrap();
+        }
+        assert!(!dir.join(format!("{METRICS_DB}-shm")).exists());
+        // The directory and the database are the reader's to read and not
+        // to write, as a group member's are.
+        let mode = |path: &std::path::Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(&dir.join(METRICS_DB), 0o400);
+        mode(&dir, 0o500);
+        let opened = open(&dir, METRICS_DB).map(|connection| {
+            connection
+                .query_row("SELECT count(*) FROM kept", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        });
+        mode(&dir, 0o700);
+        assert_eq!(opened.unwrap(), 2);
+    }
 
     fn node(id: u8, parent: Option<u8>, command: &str, failed: bool) -> Node {
         Node {

@@ -1,0 +1,2 @@
+# The collector's user, and the group whose members may watch its store.
+u timeless-acct - "timeless-acct collector" /var/lib/timeless-acct

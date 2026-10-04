@@ -1,5 +1,43 @@
 # Changes
 
+## 0.2.4
+
+- A store in a standard place, so starting, watching, and stopping need
+  nothing said about where (#25). `run` records into the user's own
+  store, `~/.local/share/timeless-acct`, or as root into the host's,
+  `/var/lib/timeless-acct`; `watch`, `top`, `exits`, and `trees` read the
+  user's own if there is one and the host's otherwise. `--data-dir` and
+  `TIMELESS_ACCT_DATA` still name another. The old default was
+  `timeless-acct-data`, relative to wherever the command was run.
+
+- The service keeps a local store in `/var/lib/timeless-acct`, where it
+  had sent to the planes; it runs as a `timeless-acct` user of its own
+  (`dist/timeless-acct.sysusers`) instead of `DynamicUser=`, and the
+  members of the `timeless-acct` group may watch it. `dist/install.sh`
+  installs, upgrades, and uninstalls it.
+
+- A store's files are as private as its directory: `0600`, or `0640`
+  where the directory lets its group in. A reader refused a store says so,
+  and how to be let in, where it said the store did not exist.
+
+- A stopped store can be read by someone who may not write beside it, a
+  member of its group or a read-only mount: with no collector holding it,
+  it is opened as immutable. Before, the reader was told it could not
+  write a read-only database.
+
+- A container image, `ghcr.io/awksedgreep/timeless-acct`, built from each
+  version tag. It is a host agent in an image: rootful, with the host's
+  PID, network, and cgroup namespaces and three capabilities. In a
+  rootless container the kernel refuses exit accounting.
+
+- The viewer's header has the version beside the name.
+
+- The warning when the kernel refuses exit accounting is one sentence
+  again, without a run of spaces in the middle.
+
+- The README is a quick start; what was in it is in `docs/`: running,
+  watching, reading, what is recorded, and what it costs.
+
 ## 0.2.3
 
 - The store engine is timeless-libsql 0.8.9 (from 0.8.6). Compaction
@@ -48,7 +86,7 @@
   clamps stale selections, shifting from live lands on the last stored
   moment, and time fields no longer byte-slice the clock (#23, #24).
 
-## Not yet in a version
+## 0.2.4
 
 - The viewer keeps the pace of the store. It took samples to be ten
   seconds apart: a store sampled less often than every thirty seconds

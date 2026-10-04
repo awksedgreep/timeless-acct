@@ -14,6 +14,8 @@ mod engine;
 mod lineage;
 mod model;
 mod netlink;
+#[cfg(feature = "embedded")]
+mod place;
 mod procevents;
 mod procfs;
 #[cfg(feature = "embedded")]
@@ -140,7 +142,8 @@ fn listen<T>(what: &str, without: &str, started: std::io::Result<T>) -> Option<T
         Ok(listener) => Some(listener),
         Err(error) if error.kind() == ErrorKind::PermissionDenied => {
             eprintln!(
-                "timeless-acct: the kernel refused {what} (it needs CAP_NET_ADMIN).                  {without}; `timeless-acct check` says what to do about it."
+                "timeless-acct: the kernel refused {what} (it needs CAP_NET_ADMIN). \
+                 {without}; `timeless-acct check` says what to do about it."
             );
             None
         }
@@ -156,7 +159,7 @@ fn open_sink(args: &RunArgs) -> Result<Box<dyn Sink>> {
         #[cfg(feature = "embedded")]
         SinkKind::Embedded => Box::new(sink::embedded::EmbeddedSink::open(
             &sink::embedded::EmbeddedOptions {
-                dir: args.data_dir.clone(),
+                dir: place::to_write(args.data_dir.clone()),
                 retention: args.retention.clone(),
                 rollups: args.rollups.clone(),
                 log_retention: args.log_retention.clone(),
