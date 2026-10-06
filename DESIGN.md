@@ -161,6 +161,18 @@ the author of its unit file, so only a suffix too long to be a version is
 removed: `postgresql-16.service` keeps its number, and
 `omarchy-browser-1790704088432165608.service` does not.
 
+**A connection to a socket is named for the socket's service.** A socket
+with `Accept=yes` starts an instance of a template for every connection,
+and systemd names it for the connection:
+`galera-clustercheck@724573-192.168.92.10:9200-192.168.92.11:44430.service`.
+A load balancer that checks a database through such a socket makes one a
+second. Under their own names, two production pods had 8,602 series of
+these after a day, each a few seconds long, and the span index had a term
+for each: 100 bytes a span, twice what the spans themselves took. An
+instance that is numbers and then two addresses with ports is one
+connection, and is named for its template, `galera-clustercheck@.service`.
+Versions of systemd differ in how many numbers come first.
+
 **A unit named for a container is reported as what runs the container.**
 A container runtime names a container's health check for the container's
 id: sixty-four hexadecimal digits that say nothing and are different after

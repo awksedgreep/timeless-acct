@@ -1,5 +1,13 @@
 # Changes
 
+## 0.2.5
+
+- A connection to a socket with `Accept=yes` is named for the socket's
+  service, `galera-clustercheck@.service`, where it was a unit of its own
+  named for the connection (#26). A health check made through such a
+  socket every second was a new unit every second: on two production pods,
+  11% of the series, and a span index of 100 bytes a span, twice the spans.
+
 ## 0.2.4
 
 - A store in a standard place, so starting, watching, and stopping need

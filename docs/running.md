@@ -75,7 +75,7 @@ sudo podman run -d --name timeless-acct \
   --read-only \
   -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
   -v /var/lib/timeless-acct:/var/lib/timeless-acct \
-  ghcr.io/awksedgreep/timeless-acct:0.2.4
+  ghcr.io/awksedgreep/timeless-acct:0.2.5
 
 sudo podman exec -it timeless-acct timeless-acct watch
 ```

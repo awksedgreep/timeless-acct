@@ -94,6 +94,25 @@ fn random_hex(token: &str, at_least: usize) -> bool {
         && token.bytes().any(|b| b.is_ascii_digit())
 }
 
+/// Whether an instance is one connection to a socket with `Accept=yes`,
+/// which systemd names for a counter, the connection's addresses, and in
+/// later versions a number between: `724573-192.168.92.10:9200-192.168.92.11:44430`,
+/// `0-32774-127.0.0.1:39811-127.0.0.1:40200`. A health check through such a
+/// socket is a new instance every second. A connection over a unix socket
+/// is named for numbers alone, and is numbered already.
+fn per_connection(instance: &str) -> bool {
+    let parts: Vec<&str> = instance.split('-').collect();
+    match parts.split_last_chunk::<2>() {
+        Some((numbers, [local, remote])) => {
+            !numbers.is_empty()
+                && numbers.iter().all(|part| all_digits(part))
+                && local.contains(':')
+                && remote.contains(':')
+        }
+        None => false,
+    }
+}
+
 /// The name of a unit without what marks one instance of it.
 ///
 /// A desktop starts each application in a scope of its own, named for the
@@ -116,7 +135,7 @@ pub fn normalize(name: &str) -> String {
         let numbered = instance
             .split(['-', '_'])
             .all(|part| all_digits(part) || random_hex(part, 6));
-        if template != "user" && numbered {
+        if template != "user" && (numbered || per_connection(instance)) {
             return format!("{template}@.{suffix}");
         }
         return name.to_string();
@@ -439,6 +458,10 @@ mod tests {
             "getty@tty1.service",
             "wayland-wm@hyprland.desktop.service",
             "user@1000.service",
+            // Instances named for something other than a connection.
+            "systemd-fsck@dev-disk-by\\x2duuid-0a1b.service",
+            "openvpn-client@site-a.service",
+            "container-getty@1:2.service",
             // A word that happens to be hexadecimal is still a word.
             "serve-facade.service",
         ] {
@@ -465,6 +488,21 @@ mod tests {
                 "omarchy-browser-1790704088432165608.service",
                 "omarchy-browser.service",
             ),
+            // A connection to a socket with Accept=yes, over TCP and IPv6,
+            // and over a unix socket.
+            (
+                "galera-clustercheck@724573-192.168.92.10:9200-192.168.92.11:44430.service",
+                "galera-clustercheck@.service",
+            ),
+            (
+                "sshd@3-[2001:db8::1]:22-[2001:db8::2]:51234.service",
+                "sshd@.service",
+            ),
+            (
+                "tacct-acceptest@0-32774-127.0.0.1:39811-127.0.0.1:40200.service",
+                "tacct-acceptest@.service",
+            ),
+            ("varlink@17-4321-0.service", "varlink@.service"),
             // A container's health check, named for the container's id.
             (
                 "3f9a1c07e5b24d68a0c1f2e3d4b5a69788776655443322110ffeeddccbbaa991-1f2e3d4c5b6a7980.service",
